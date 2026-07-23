@@ -2621,15 +2621,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
+        retraction_order: Optional[List[int]] = None,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(
-            self.reqs,
-            server_args,
-            allow_policy_sort=(
-                self.spec_algorithm is None or self.spec_algorithm.is_none()
-            ),
+        sorted_indices = (
+            retraction_order
+            if retraction_order is not None
+            else self._get_decode_retraction_order(
+                self.reqs,
+                server_args,
+                allow_policy_sort=(
+                    self.spec_algorithm is None or self.spec_algorithm.is_none()
+                ),
+            )
         )
 
         retracted_reqs = []

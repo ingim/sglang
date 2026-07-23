@@ -789,6 +789,11 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = "fcfs"
+    plex_policy: A[
+        Optional[str],
+        "Path to a PLEX .plexpkg policy package. PLEX controls admission, prefill scheduling, decode retraction, and feedback; unavailable or fallback outcomes preserve native behavior.",
+        NS("schedule"),
+    ] = None
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

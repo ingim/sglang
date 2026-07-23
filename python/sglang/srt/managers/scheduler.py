@@ -79,6 +79,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.async_plex import AsyncPlexPolicyController
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -561,6 +562,7 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
+        self.init_plex()
 
         self.is_initializing = False
 
@@ -1082,6 +1084,20 @@ class Scheduler(
             self.server_args
         )
 
+    def init_plex(self):
+        self.plex: Optional[AsyncPlexPolicyController] = None
+        if self.server_args.plex_policy is None:
+            return
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            raise ValueError(
+                "PLEX currently supports SGLang's non-disaggregated scheduler only"
+            )
+        self.plex = AsyncPlexPolicyController.from_policy(
+            self.server_args.plex_policy,
+            model=self.server_args.model_path,
+            target_id=f"dp-{self.ps.dp_rank or 0}",
+        )
+
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
@@ -1468,6 +1484,12 @@ class Scheduler(
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
+        if self.plex is not None:
+            self.plex.close()
+
+    def publish_plex(self) -> None:
+        if self.plex is not None:
+            self.plex.publish(self)
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1529,6 +1551,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.publish_plex()
             if self._engine_paused:
                 continue
 
@@ -1572,6 +1595,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.publish_plex()
             if self._engine_paused:
                 continue
 
@@ -2430,6 +2454,15 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
+        plex = getattr(self, "plex", None)
+        if (
+            plex is not None
+            and not is_retracted
+            and not req.finished()
+            and not plex.tracks(req.rid)
+        ):
+            plex.register_request(req)
+
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
         if self.enable_priority_scheduling and req.priority is None:
@@ -2502,6 +2535,10 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        if (plex := getattr(self, "plex", None)) is not None and plex.tracks(
+            req_to_abort.rid
+        ):
+            plex.mark_finished(req_to_abort)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2533,6 +2570,10 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
+            if (plex := getattr(self, "plex", None)) is not None:
+                for req in deleted_reqs:
+                    if plex.tracks(req.rid):
+                        plex.mark_finished(req)
 
     def handle_embedding_request(
         self,
@@ -2915,6 +2956,17 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
+        plex_plan = None
+        plex = getattr(self, "plex", None)
+        if plex is not None:
+            plex_plan = plex.poll_schedule()
+            if plex_plan is not None:
+                self.waiting_queue.sort(
+                    key=lambda req: (
+                        plex_plan.rank(req.rid) is None,
+                        plex_plan.rank(req.rid) or 0,
+                    )
+                )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -2971,6 +3023,8 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if plex_plan is not None and not plex_plan.selects(req.rid):
+                continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3183,8 +3237,15 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
+            retraction_order = None
+            plex = getattr(self, "plex", None)
+            if plex is not None and (
+                batch.spec_algorithm is None or batch.spec_algorithm.is_none()
+            ):
+                retraction_order = plex.cached_retraction_order(batch.reqs)
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args,
+                retraction_order=retraction_order,
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
@@ -3232,6 +3293,10 @@ class Scheduler(
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
+            if plex is not None:
+                for req in retracted_reqs:
+                    plex.mark_retracted(req)
+                plex.observe_batch(reqs_to_abort)
         else:
             self.new_token_ratio_tracker.decay_step()
 
@@ -3611,6 +3676,9 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+        if (plex := getattr(self, "plex", None)) is not None:
+            plex.observe_batch(batch.reqs)
+            self.publish_plex()
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
@@ -4052,6 +4120,7 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        plex_aborted_reqs = []
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -4097,6 +4166,12 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+            plex_aborted_reqs.append(req)
+
+        if (plex := getattr(self, "plex", None)) is not None:
+            for req in plex_aborted_reqs:
+                if plex.tracks(req.rid):
+                    plex.mark_finished(req)
 
         if self.dllm_config is not None:
             for req in self.dllm_manager.pop_aborted_reqs(

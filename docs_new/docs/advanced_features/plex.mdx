@@ -1,0 +1,96 @@
+---
+title: PLEX Serving Policies
+description: Run portable WebAssembly admission, scheduling, eviction, and feedback policies inside SGLang.
+---
+
+PLEX loads an operator-provided WebAssembly policy package into an asynchronous
+worker beside the SGLang scheduler. The scheduler never waits for Wasm. It
+consumes cached prefill and retraction plans while membership snapshots and
+coalesced feedback are processed off the decode hot path.
+
+## Installation and startup
+
+Install the optional `pie-plex` runtime and pass a `.plexpkg` file:
+
+```bash
+pip install "sglang[plex]"
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --plex-policy /path/to/policy.plexpkg
+```
+
+For a source checkout where `pie-plex` is not published on the configured
+package index, install the PLEX Python binding directly before starting SGLang.
+
+The offline engine accepts the same argument:
+
+```python
+import sglang as sgl
+
+engine = sgl.Engine(
+    model_path="Qwen/Qwen2.5-0.5B-Instruct",
+    plex_policy="/path/to/policy.plexpkg",
+)
+```
+
+## Request metadata
+
+Pass PLEX metadata through `sampling_params.custom_params`:
+
+```json
+{
+  "text": "Hello",
+  "sampling_params": {
+    "max_new_tokens": 32,
+    "custom_params": {
+      "plex": {
+        "logical_request_id": "workflow-42",
+        "generation_id": 0,
+        "tenant": "acme"
+      }
+    }
+  }
+}
+```
+
+The OpenAI-compatible APIs expose the same `custom_params` field through
+`extra_body`. Metadata keys other than the reserved lifecycle keys become
+`fields.metadata`. The adapter exposes `prompt_token_ids`, `max_tokens`, and
+`priority` in `fields.body`.
+
+## Logical request continuations
+
+Set `terminal` to `false` when a generation will continue after a tool or
+application boundary:
+
+```json
+{
+  "logical_request_id": "workflow-42",
+  "generation_id": 0,
+  "terminal": false,
+  "completion_event": "tool-boundary"
+}
+```
+
+The next request reuses `logical_request_id` and increments `generation_id`.
+PLEX receives a `continue` lifecycle event and preserves request state.
+
+## Attachment semantics
+
+| PLEX hook | SGLang attachment |
+|---|---|
+| `admit` | Not attached in-engine; use the deployment router or ingress |
+| `schedule` | Cached prefill admission set and ordering |
+| `evict` | Cached decode retraction order |
+| `feedback` | Coalesced completion, abort, and retraction feedback |
+| `route` | Not attached; routing belongs to the deployment router |
+
+SGLang executes every request already resident in a decode batch. Therefore
+PLEX scheduling is an amortized prefill-admission policy rather than a
+candidate-local callback on every decode token.
+
+The scheduler never waits for PLEX. Missing, stale, unavailable, and failed
+decisions preserve SGLang's native behavior. PLEX actions and per-token
+feedback are not advertised. This integration currently rejects
+SGLang disaggregated serving modes; router-to-engine and cross-process policy
+state require a distributed PLEX state backend.
