@@ -280,3 +280,60 @@ def test_port_passes_the_contract_conformance_harness():
     report = conformance(SGLangEnginePort(scheduler), POLICY)
 
     assert report.problems == [], report.problems
+
+
+def test_port_publishes_only_facts_the_contract_defines():
+    """A misspelt fact reads as zero to a policy, so catch it here instead.
+
+    `unwrap_or(0)` is how every policy reads a fact, which makes a name the
+    engine got wrong indistinguishable from a signal that is genuinely zero:
+    the policy keeps running and quietly stops discriminating.
+    """
+    check_facts = plex_engine.check_facts
+    scheduler = fake_scheduler()
+    scheduler.waiting_queue = [FakeRequest("a")]
+    scheduler.running_batch = SimpleNamespace(reqs=[FakeRequest("b")])
+    port = SGLangEnginePort(scheduler)
+
+    check_facts(port.engine_facts(), "engine", where="sglang")
+    for view in (*port.candidates(), *port.residents()):
+        check_facts(view.facts(), "request", where="sglang")
+        check_facts(view.cache_facts(), "cache", where="sglang")
+
+
+def test_prefix_hit_and_resident_length_are_told_apart():
+    """`cached_tokens` is what is resident; the prefix hit is its own fact.
+
+    SGLang calls the prefix match `num_matched_prefix_tokens` and tracks
+    committed KV separately, and a policy that reclaims needs the second
+    while a policy that routes needs the first.
+    """
+    scheduler = fake_scheduler()
+    request = FakeRequest("a")
+    request.num_matched_prefix_tokens = 3
+    request.kv_committed_len = 1
+    scheduler.waiting_queue = [request]
+    port = SGLangEnginePort(scheduler)
+
+    facts = port.candidates()[0].facts()
+    assert facts["lpm_hit_tokens"] == 3
+    assert facts["cached_tokens"] == 1
+    assert facts["prompt_tokens"] == 4
+    assert facts["uncached_tokens"] == 1
+    assert facts["prefix_hit_ratio_ppm"] == 750_000
+    assert port.residents() == []
+
+
+def test_arrival_order_survives_the_queue_being_reordered():
+    scheduler = fake_scheduler()
+    first, second = FakeRequest("a"), FakeRequest("b")
+    plex = build(scheduler)
+    plex.register_request(first)
+    plex.register_request(second)
+    scheduler.waiting_queue = [second, first]
+
+    seqs = {
+        view.engine_id: view.facts()["arrival_seq"]
+        for view in plex.port.candidates()
+    }
+    assert seqs == {"a": 0, "b": 1}

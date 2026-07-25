@@ -13,7 +13,13 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any
 
-from plex.engine import CacheCapacity, PolicyController, ScheduleCapacity
+from plex.engine import (
+    NO_SIGNALS,
+    CacheCapacity,
+    PolicyController,
+    RequestSignals,
+    ScheduleCapacity,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -25,11 +31,17 @@ DEFAULT_PRINCIPAL = "sglang-default"
 class SGLangRequest:
     """One `Req`, answering the questions `plex.engine` asks of a request."""
 
-    __slots__ = ("_request", "_bytes_per_token")
+    __slots__ = ("_bytes_per_token", "_request", "_signals")
 
-    def __init__(self, request: Req, bytes_per_token: int) -> None:
+    def __init__(
+        self,
+        request: Req,
+        bytes_per_token: int,
+        signals: RequestSignals | None = None,
+    ) -> None:
         self._request = request
         self._bytes_per_token = bytes_per_token
+        self._signals = signals if signals is not None else NO_SIGNALS
 
     @property
     def engine_id(self) -> str:
@@ -52,13 +64,55 @@ class SGLangRequest:
         entered = request.time_stats.wait_queue_entry_time
         if entered <= 0:
             entered = request.time_stats.scheduler_recv_time
+        waiting_ms = max(int((time.perf_counter() - entered) * 1000), 0)
+        running = request.kv_committed_len > 0
+        prompt_tokens = len(request.origin_input_ids)
+        hit = min(request.num_matched_prefix_tokens, prompt_tokens)
+        uncached = prompt_tokens - hit
         return {
             "attained_service": request.kv_committed_len,
+            "service_tokens": request.kv_committed_len,
             "generated_tokens": len(request.output_ids),
             "preempted": request.is_retracted,
-            "waiting_ms": max(int((time.perf_counter() - entered) * 1000), 0),
-            "cached_tokens": request.num_matched_prefix_tokens,
+            "waiting_ms": waiting_ms,
+            "call_wait_us": waiting_ms * 1000,
+            "current_queue_ms": 0 if running else waiting_ms,
+            # SGLang's own name for the prefix hit is
+            # `num_matched_prefix_tokens`; `cached_tokens` means what is
+            # resident, which is what it has actually committed.
+            "cached_tokens": request.kv_committed_len,
+            "lpm_hit_tokens": hit,
+            "uncached_tokens": uncached,
+            "new_prefill_tokens": max(
+                uncached - max(request.kv_committed_len - hit, 0), 0
+            ),
+            "prefix_hit_ratio_ppm": (
+                hit * 1_000_000 // prompt_tokens if prompt_tokens else 0
+            ),
+            "cache_ready": hit > 0,
+            "prompt_tokens": prompt_tokens,
+            "computation_length": prompt_tokens + len(request.output_ids),
+            "dispatch_input_tokens": max(
+                prompt_tokens - request.kv_committed_len, 0
+            ),
+            "queue_member": not running,
+            "scheduler_state": "running" if running else "waiting",
             "arrival_ms": self.arrival_ms(),
+            "arrival_seq": self._signals.arrival_seq,
+            "now_ms": int(time.time() * 1000),
+        }
+
+    def cache_facts(self) -> dict[str, Any]:
+        request = self._request
+        return {
+            "cached_length": request.kv_committed_len,
+            "computation_length": (
+                len(request.origin_input_ids) + len(request.output_ids)
+            ),
+            "last_access_ms": self._signals.last_access_ms,
+            "state_kind": "retracted" if request.is_retracted else "resident",
+            "tier": "gpu",
+            "leaf": True,
         }
 
     def arrival_ms(self) -> int:
@@ -102,9 +156,42 @@ class SGLangEnginePort:
 
     def __init__(self, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
+        self._signals: dict[str, RequestSignals] = {}
+        self._arrivals = 0
+        self._probed_tokens = 0
+        self._hit_tokens = 0
+
+    def observe(self, request: Req) -> RequestSignals:
+        """Record arrival order; SGLang matches the prefix itself, later."""
+        self._arrivals += 1
+        signals = RequestSignals(
+            arrival_seq=self._arrivals - 1,
+            lpm_hit_tokens=request.num_matched_prefix_tokens,
+        )
+        self._signals[request.rid] = signals
+        return signals
+
+    def touch(self, request: Req) -> None:
+        signals = self._signals.get(request.rid)
+        if signals is None:
+            return
+        signals.touch()
+        # The match happens when SGLang admits the request, after the policy
+        # was asked; carry it forward so later decisions see the real hit.
+        if request.num_matched_prefix_tokens > signals.lpm_hit_tokens:
+            self._hit_tokens += (
+                request.num_matched_prefix_tokens - signals.lpm_hit_tokens
+            )
+            self._probed_tokens += len(request.origin_input_ids)
+            signals.lpm_hit_tokens = request.num_matched_prefix_tokens
+
+    def forget(self, request_id: str) -> None:
+        self._signals.pop(request_id, None)
 
     def view(self, request: Req) -> SGLangRequest:
-        return SGLangRequest(request, self.bytes_per_token())
+        return SGLangRequest(
+            request, self.bytes_per_token(), self._signals.get(request.rid)
+        )
 
     def bytes_per_token(self) -> int:
         allocator = self.scheduler.token_to_kv_pool_allocator
@@ -115,7 +202,7 @@ class SGLangEnginePort:
     def candidates(self) -> list[SGLangRequest]:
         bytes_per_token = self.bytes_per_token()
         return [
-            SGLangRequest(request, bytes_per_token)
+            SGLangRequest(request, bytes_per_token, self._signals.get(request.rid))
             for request in self.scheduler.waiting_queue
             if not request.finished()
         ]
@@ -123,7 +210,7 @@ class SGLangEnginePort:
     def residents(self) -> list[SGLangRequest]:
         bytes_per_token = self.bytes_per_token()
         return [
-            SGLangRequest(request, bytes_per_token)
+            SGLangRequest(request, bytes_per_token, self._signals.get(request.rid))
             for request in self.scheduler.running_batch.reqs
         ]
 
@@ -155,11 +242,32 @@ class SGLangEnginePort:
     def engine_facts(self) -> dict[str, Any]:
         scheduler = self.scheduler
         allocator = scheduler.token_to_kv_pool_allocator
+        free_tokens = allocator.available_size()
+        total_tokens = allocator.size_full
+        per_token = self.bytes_per_token()
+        running = len(scheduler.running_batch.reqs)
         return {
             "queue_depth": len(scheduler.waiting_queue),
-            "running_requests": len(scheduler.running_batch.reqs),
-            "free_kv_tokens": allocator.available_size(),
-            "total_kv_tokens": allocator.size_full,
+            "running_requests": running,
+            "batch_size": running,
+            "max_batch_size": scheduler.max_running_requests,
+            "max_total_tokens": scheduler.max_prefill_tokens,
+            "free_kv_tokens": free_tokens,
+            "total_kv_tokens": total_tokens,
+            "used_kv_ppm": (
+                (total_tokens - free_tokens) * 1_000_000 // total_tokens
+                if total_tokens
+                else 0
+            ),
+            "memory_capacity": total_tokens * per_token,
+            "active_kv_bytes": (total_tokens - free_tokens) * per_token,
+            "hit_ratio_ppm": (
+                self._hit_tokens * 1_000_000 // self._probed_tokens
+                if self._probed_tokens
+                else 0
+            ),
+            "kv_overloaded": total_tokens > 0 and free_tokens * 2 <= total_tokens,
+            "now_ms": int(time.time() * 1000),
         }
 
 
@@ -199,6 +307,7 @@ class AsyncPlexPolicyController:
         return self.controller.tracks(engine_id)
 
     def register_request(self, request: Req) -> None:
+        self.port.observe(request)
         self.controller.register_request(self.port.view(request))
 
     def mark_retracted(self, request: Req) -> None:
@@ -206,12 +315,14 @@ class AsyncPlexPolicyController:
 
     def observe_batch(self, requests: list[Req]) -> None:
         for request in requests:
+            self.port.touch(request)
             if request.finished() and self.tracks(request.rid):
                 self.mark_finished(request)
 
     def mark_finished(self, request: Req) -> None:
         view = self.port.view(request)
         self.controller.mark_finished(view, view.finish_reason())
+        self.port.forget(request.rid)
 
     def publish(self, scheduler: Scheduler | None = None) -> None:
         self.controller.publish()
