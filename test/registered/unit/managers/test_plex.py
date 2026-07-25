@@ -1,31 +1,34 @@
-import json
+"""Tests for SGLang's PLEX binding.
+
+The binding is a port now: the state machine lives in `plex.engine`, which
+ships with the contract and is tested there. What is worth testing here is
+that this port describes SGLang correctly, and that the scheduler-facing
+adapter still speaks the shape `scheduler.py` expects.
+
+Set PLEX_TEST_POLICY to a built .plexpkg to also run the contract's own
+conformance harness against this port, which drives a real policy through a
+real host.
+"""
+
+import os
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.managers.async_plex import AsyncPlexPolicyController
+import pytest
 
+from sglang.srt.managers.async_plex import (
+    AsyncPlexPolicyController,
+    SGLangEnginePort,
+)
 
-class FakeAsyncRuntime:
-    def __init__(self):
-        self.submissions = []
-        self.latest_results = {}
+# The host always reports what it changed, and the binding refuses an outcome
+# that omits it rather than guessing the policy left state alone.
+NO_STATE_CHANGE = {"requests": [], "groups": [], "shared": None}
 
-    def try_submit(self, channel, epoch, event):
-        self.submissions.append((channel, epoch, event))
-        return True
+plex_engine = pytest.importorskip("plex.engine")
 
-    def try_submit_bytes(self, channel, epoch, event):
-        self.submissions.append((channel, epoch, json.loads(event)))
-        return True
-
-    def latest(self, channel, after_epoch=0):
-        result = self.latest_results.get(channel)
-        if result is None or result[0] <= after_epoch:
-            return None
-        return result
-
-    def shutdown(self):
-        return None
+PolicyController = plex_engine.PolicyController
+POLICY = os.environ.get("PLEX_TEST_POLICY")
 
 
 class FakeRequest:
@@ -74,133 +77,206 @@ def fake_scheduler():
     )
 
 
-def test_async_schedule_plan_is_published_and_consumed():
-    runtime = FakeAsyncRuntime()
-    scheduler = fake_scheduler()
-    requests = [FakeRequest("a"), FakeRequest("b")]
-    scheduler.waiting_queue = requests
-    controller = AsyncPlexPolicyController(
-        runtime,
+def build(scheduler, runtime=None):
+    from plex.engine.testing import RecordingRuntime
+
+    port = SGLangEnginePort(scheduler)
+    controller = PolicyController(
+        runtime or RecordingRuntime(),
+        port,
         model="test-model",
         target_id="test",
     )
-    for request in requests:
-        controller.register_request(request)
+    return AsyncPlexPolicyController(controller, port)
 
-    controller.publish(scheduler)
-    epoch = controller.epoch
-    runtime.latest_results["schedule"] = (
+
+def test_port_reads_the_schedulers_own_names():
+    scheduler = fake_scheduler()
+    waiting = [FakeRequest("a")]
+    running = [FakeRequest("b")]
+    scheduler.waiting_queue = waiting
+    scheduler.running_batch = SimpleNamespace(reqs=running)
+    port = SGLangEnginePort(scheduler)
+
+    assert [view.engine_id for view in port.candidates()] == ["a"]
+    assert [view.engine_id for view in port.residents()] == ["b"]
+
+    capacity = port.capacity()
+    assert capacity.max_total_tokens == scheduler.max_prefill_tokens
+    assert capacity.max_selections == 1
+
+    facts = port.engine_facts()
+    assert facts["queue_depth"] == 1
+    assert facts["running_requests"] == 1
+    assert facts["free_kv_tokens"] == 64
+    assert facts["total_kv_tokens"] == 128
+
+
+def test_cache_budget_keeps_a_no_retraction_ordering_valid():
+    """SGLang ranks rather than evicts, so keeping everything is an answer."""
+    scheduler = fake_scheduler()
+    scheduler.running_batch = SimpleNamespace(
+        reqs=[FakeRequest("a"), FakeRequest("b")]
+    )
+    port = SGLangEnginePort(scheduler)
+    residents = port.residents()
+    resident_bytes = sum(view.size_bytes() for view in residents)
+
+    assert port.cache_capacity(residents).max_bytes == resident_bytes
+
+
+def test_schedule_plan_is_published_and_consumed():
+    from plex.engine.testing import RecordingRuntime
+
+    runtime = RecordingRuntime()
+    scheduler = fake_scheduler()
+    requests = [FakeRequest("a"), FakeRequest("b")]
+    scheduler.waiting_queue = requests
+    plex = build(scheduler, runtime)
+    for request in requests:
+        plex.register_request(request)
+
+    plex.publish()
+    epoch = runtime.submitted[0][1]
+    runtime.reply(
+        "schedule",
         epoch,
         {
             "status": "success",
             "plan": {
                 "operation": "schedule",
-                "plan": {
-                    "selections": [{"requests": [1], "token_budgets": [4]}]
-                },
+                "plan": {"selections": [{"requests": [1], "token_budgets": [4]}]},
             },
+            "state_update": NO_STATE_CHANGE,
         },
     )
-    submitted = len(runtime.submissions)
+    submitted = len(runtime.submitted)
 
-    plan = controller.poll_schedule()
+    plan = plex.poll_schedule()
 
     assert plan is not None
     assert plan.rank("a") is None
     assert plan.rank("b") == 0
-    assert len(runtime.submissions) == submitted
+    assert len(runtime.submitted) == submitted
 
 
-def test_async_missing_plan_is_native_fallback():
-    controller = AsyncPlexPolicyController(
-        FakeAsyncRuntime(),
-        model="test-model",
-        target_id="test",
-    )
-
-    assert controller.poll_schedule() is None
+def test_missing_plan_is_native_fallback():
+    assert build(fake_scheduler()).poll_schedule() is None
 
 
-def test_async_cache_retraction_order_is_parsed():
-    runtime = FakeAsyncRuntime()
+def test_cache_retraction_order_is_parsed():
+    from plex.engine.testing import RecordingRuntime
+
+    runtime = RecordingRuntime()
     scheduler = fake_scheduler()
     residents = [FakeRequest("a"), FakeRequest("b")]
     scheduler.running_batch = SimpleNamespace(reqs=residents)
-    controller = AsyncPlexPolicyController(
-        runtime,
-        model="test-model",
-        target_id="test",
-    )
+    plex = build(scheduler, runtime)
     for request in residents:
-        controller.register_request(request)
+        plex.register_request(request)
 
-    controller.publish(scheduler)
-    epoch = controller.epoch
-    runtime.latest_results["cache"] = (
+    plex.publish()
+    epoch = next(
+        e for channel, e, _ in runtime.submitted if channel == "cache"
+    )
+    runtime.reply(
+        "cache",
         epoch,
         {
             "status": "success",
-            "plan": {
-                "operation": "cache",
-                "plan": {"reclaim": [0]},
-            },
+            "plan": {"operation": "cache", "plan": {"reclaim": [0]}},
+            "state_update": NO_STATE_CHANGE,
         },
     )
 
-    order = controller.cached_retraction_order(residents)
-
-    assert order == [1, 0]
+    assert plex.cached_retraction_order(residents) == [1, 0]
 
 
-def test_async_outcome_with_actions_is_rejected():
-    runtime = FakeAsyncRuntime()
+def test_retraction_order_for_a_different_batch_is_refused():
+    """A ranking over one set is not a ranking over another."""
+    from plex.engine.testing import RecordingRuntime
+
+    runtime = RecordingRuntime()
+    scheduler = fake_scheduler()
+    residents = [FakeRequest("a"), FakeRequest("b")]
+    scheduler.running_batch = SimpleNamespace(reqs=residents)
+    plex = build(scheduler, runtime)
+    for request in residents:
+        plex.register_request(request)
+    plex.publish()
+    epoch = next(e for channel, e, _ in runtime.submitted if channel == "cache")
+    runtime.reply(
+        "cache",
+        epoch,
+        {
+            "status": "success",
+            "plan": {"operation": "cache", "plan": {"reclaim": [0]}},
+            "state_update": NO_STATE_CHANGE,
+        },
+    )
+
+    assert plex.cached_retraction_order(list(reversed(residents))) is None
+
+
+def test_outcome_with_unnegotiated_actions_is_rejected():
+    from plex.engine.testing import RecordingRuntime
+
+    runtime = RecordingRuntime()
     scheduler = fake_scheduler()
     requests = [FakeRequest("a"), FakeRequest("b")]
     scheduler.waiting_queue = requests
-    controller = AsyncPlexPolicyController(
-        runtime,
-        model="test-model",
-        target_id="test",
-    )
+    plex = build(scheduler, runtime)
     for request in requests:
-        controller.register_request(request)
+        plex.register_request(request)
 
-    controller.publish(scheduler)
-    epoch = controller.epoch
-    runtime.latest_results["schedule"] = (
+    plex.publish()
+    epoch = runtime.submitted[0][1]
+    runtime.reply(
+        "schedule",
         epoch,
         {
             "status": "success",
             "plan": {
                 "operation": "schedule",
-                "plan": {
-                    "selections": [{"requests": [1], "token_budgets": [4]}]
-                },
+                "plan": {"selections": [{"requests": [1], "token_budgets": [4]}]},
             },
+            "state_update": NO_STATE_CHANGE,
             "actions": [{"mechanic": "request.pause@1"}],
         },
     )
 
-    assert controller.poll_schedule() is None
+    assert plex.poll_schedule() is None
 
 
-def test_async_feedback_waits_for_publish():
-    runtime = FakeAsyncRuntime()
+def test_feedback_waits_for_publish():
+    from plex.engine.testing import RecordingRuntime
+
+    runtime = RecordingRuntime()
     scheduler = fake_scheduler()
     request = FakeRequest("request")
-    controller = AsyncPlexPolicyController(
-        runtime,
-        model="test-model",
-        target_id="test",
-    )
-    controller.register_request(request)
+    plex = build(scheduler, runtime)
+    plex.register_request(request)
     request.finished_reason = SimpleNamespace(to_json=lambda: {"type": "stop"})
-    controller.mark_finished(request)
+    plex.mark_finished(request)
 
-    assert runtime.submissions == []
-    controller.publish(scheduler)
+    assert runtime.submitted == []
+    plex.publish()
 
     feedback = [
-        event for channel, _epoch, event in runtime.submissions if channel == "feedback"
+        event for event in runtime.events() if event["operation"] == "feedback"
     ]
     assert len(feedback) == 1
+
+
+@pytest.mark.skipif(not POLICY, reason="PLEX_TEST_POLICY is not set")
+def test_port_passes_the_contract_conformance_harness():
+    """Drive this port through a real policy and a real host."""
+    from plex.engine.testing import conformance
+
+    scheduler = fake_scheduler()
+    scheduler.waiting_queue = [FakeRequest("a"), FakeRequest("b")]
+    scheduler.running_batch = SimpleNamespace(reqs=[FakeRequest("c")])
+
+    report = conformance(SGLangEnginePort(scheduler), POLICY)
+
+    assert report.problems == [], report.problems

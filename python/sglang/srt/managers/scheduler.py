@@ -1094,6 +1094,7 @@ class Scheduler(
             )
         self.plex = AsyncPlexPolicyController.from_policy(
             self.server_args.plex_policy,
+            self,
             model=self.server_args.model_path,
             target_id=f"dp-{self.ps.dp_rank or 0}",
         )
