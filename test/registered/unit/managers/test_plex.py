@@ -93,7 +93,12 @@ def test_async_schedule_plan_is_published_and_consumed():
         epoch,
         {
             "status": "success",
-            "decision": {"selected": [{"candidate_index": 1, "token_budget": 4}]},
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [{"requests": [1], "token_budgets": [4]}]
+                },
+            },
         },
     )
     submitted = len(runtime.submissions)
@@ -111,6 +116,69 @@ def test_async_missing_plan_is_native_fallback():
         FakeAsyncRuntime(),
         model="test-model",
         target_id="test",
+    )
+
+    assert controller.poll_schedule() is None
+
+
+def test_async_cache_retraction_order_is_parsed():
+    runtime = FakeAsyncRuntime()
+    scheduler = fake_scheduler()
+    residents = [FakeRequest("a"), FakeRequest("b")]
+    scheduler.running_batch = SimpleNamespace(reqs=residents)
+    controller = AsyncPlexPolicyController(
+        runtime,
+        model="test-model",
+        target_id="test",
+    )
+    for request in residents:
+        controller.register_request(request)
+
+    controller.publish(scheduler)
+    epoch = controller.epoch
+    runtime.latest_results["cache"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "cache",
+                "plan": {"reclaim": [0]},
+            },
+        },
+    )
+
+    order = controller.cached_retraction_order(residents)
+
+    assert order == [1, 0]
+
+
+def test_async_outcome_with_actions_is_rejected():
+    runtime = FakeAsyncRuntime()
+    scheduler = fake_scheduler()
+    requests = [FakeRequest("a"), FakeRequest("b")]
+    scheduler.waiting_queue = requests
+    controller = AsyncPlexPolicyController(
+        runtime,
+        model="test-model",
+        target_id="test",
+    )
+    for request in requests:
+        controller.register_request(request)
+
+    controller.publish(scheduler)
+    epoch = controller.epoch
+    runtime.latest_results["schedule"] = (
+        epoch,
+        {
+            "status": "success",
+            "plan": {
+                "operation": "schedule",
+                "plan": {
+                    "selections": [{"requests": [1], "token_budgets": [4]}]
+                },
+            },
+            "actions": [{"mechanic": "request.pause@1"}],
+        },
     )
 
     assert controller.poll_schedule() is None

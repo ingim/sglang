@@ -10,7 +10,7 @@ coalesced feedback are processed off the decode hot path.
 
 ## Installation and startup
 
-Install the optional `pie-plex` runtime and pass a `.plexpkg` file:
+Install the optional `plex` runtime and pass a `.plexpkg` file:
 
 ```bash
 pip install "sglang[plex]"
@@ -19,7 +19,7 @@ python -m sglang.launch_server \
   --plex-policy /path/to/policy.plexpkg
 ```
 
-For a source checkout where `pie-plex` is not published on the configured
+For a source checkout where `plex` is not published on the configured
 package index, install the PLEX Python binding directly before starting SGLang.
 
 The offline engine accepts the same argument:
@@ -54,9 +54,12 @@ Pass PLEX metadata through `sampling_params.custom_params`:
 ```
 
 The OpenAI-compatible APIs expose the same `custom_params` field through
-`extra_body`. Metadata keys other than the reserved lifecycle keys become
-`fields.metadata`. The adapter exposes `prompt_token_ids`, `max_tokens`, and
-`priority` in `fields.body`.
+`extra_body`. Metadata keys other than the reserved lifecycle keys
+(`logical_request_id`, `generation_id`, `principal_id`, `tenant`, `terminal`,
+`completion_outcome`) become `fields.metadata`. `principal_id` (or its `tenant`
+alias) sets the request's PLEX principal and defaults to `sglang-default`. The
+adapter exposes `prompt_token_ids`, `max_tokens`, and `priority` in
+`fields.body`.
 
 ## Logical request continuations
 
@@ -67,21 +70,23 @@ application boundary:
 {
   "logical_request_id": "workflow-42",
   "generation_id": 0,
-  "terminal": false,
-  "completion_event": "tool-boundary"
+  "terminal": false
 }
 ```
 
 The next request reuses `logical_request_id` and increments `generation_id`.
-PLEX receives a `continue` lifecycle event and preserves request state.
+PLEX receives a `continue-request` lifecycle event and preserves request state.
+For terminal requests, set `completion_outcome` to one of `auto` (default),
+`completed`, `failed`, `cancelled`, or `expired` to override the outcome PLEX
+derives from the engine finish reason.
 
 ## Attachment semantics
 
-| PLEX hook | SGLang attachment |
+| PLEX operation | SGLang attachment |
 |---|---|
 | `admit` | Not attached in-engine; use the deployment router or ingress |
 | `schedule` | Cached prefill admission set and ordering |
-| `evict` | Cached decode retraction order |
+| `cache` | Cached decode retraction order |
 | `feedback` | Coalesced completion, abort, and retraction feedback |
 | `route` | Not attached; routing belongs to the deployment router |
 
