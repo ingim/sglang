@@ -3024,7 +3024,11 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if plex_plan is not None and not plex_plan.selects(req.rid):
+            if (
+                plex_plan is not None
+                and plex_plan.saw(req.rid)
+                and not plex_plan.selects(req.rid)
+            ):
                 continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
