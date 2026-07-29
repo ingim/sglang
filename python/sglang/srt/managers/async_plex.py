@@ -89,7 +89,11 @@ class SGLangRequest:
             "prefix_hit_ratio_ppm": (
                 hit * 1_000_000 // prompt_tokens if prompt_tokens else 0
             ),
-            "cache_ready": hit > 0,
+            # Whether this request's KV is resident, which covers both what it
+            # has already committed and what it matched in the prefix cache.
+            # Testing only the hit answered `false` for a long-running request
+            # whose entire KV is resident but whose prompt shared no prefix.
+            "cache_ready": hit > 0 or request.kv_committed_len > 0,
             "prompt_tokens": prompt_tokens,
             "computation_length": prompt_tokens + len(request.output_ids),
             "dispatch_input_tokens": max(
@@ -158,6 +162,7 @@ class SGLangEnginePort:
         self.scheduler = scheduler
         self._signals: dict[str, RequestSignals] = {}
         self._arrivals = 0
+        self._probed: set[str] = set()
         self._probed_tokens = 0
         self._hit_tokens = 0
 
@@ -178,15 +183,26 @@ class SGLangEnginePort:
         signals.touch()
         # The match happens when SGLang admits the request, after the policy
         # was asked; carry it forward so later decisions see the real hit.
+        #
+        # The prompt enters the engine-wide denominator on first admission and
+        # once only. Counting it inside the "the hit grew" branch below counted
+        # only the requests that *had* a hit, so `hit_ratio_ppm` was a hit rate
+        # over hits: it could never fall, and a policy thresholding on it saw a
+        # cache that always looked warm. Found by replaying one situation
+        # through both bindings, where vLLM -- which probes every arrival --
+        # reported 300,000 ppm against SGLang's 0 on the same five requests.
+        if request.rid not in self._probed:
+            self._probed.add(request.rid)
+            self._probed_tokens += len(request.origin_input_ids)
         if request.num_matched_prefix_tokens > signals.lpm_hit_tokens:
             self._hit_tokens += (
                 request.num_matched_prefix_tokens - signals.lpm_hit_tokens
             )
-            self._probed_tokens += len(request.origin_input_ids)
             signals.lpm_hit_tokens = request.num_matched_prefix_tokens
 
     def forget(self, request_id: str) -> None:
         self._signals.pop(request_id, None)
+        self._probed.discard(request_id)
 
     def view(self, request: Req) -> SGLangRequest:
         return SGLangRequest(

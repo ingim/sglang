@@ -337,3 +337,30 @@ def test_arrival_order_survives_the_queue_being_reordered():
         for view in plex.port.candidates()
     }
     assert seqs == {"a": 0, "b": 1}
+
+
+def test_a_request_that_missed_the_cache_still_counts_toward_the_hit_ratio():
+    """`hit_ratio_ppm` is a rate, so every probed prompt is in the denominator.
+
+    The prompt used to enter it only inside the branch that fired when the
+    match had *grown*, so a request that matched nothing never counted at all
+    and the engine-wide ratio was a hit rate measured over hits: it could not
+    fall below the average of the requests that hit, and a policy thresholding
+    on it saw a cache that always looked warm. Found by replaying one
+    situation through both bindings -- vLLM, which probes every arrival,
+    reported 300,000 ppm where SGLang reported 0 on the same five requests.
+    """
+    scheduler = fake_scheduler()
+    hit, miss = FakeRequest("hit"), FakeRequest("miss")
+    port = SGLangEnginePort(scheduler)
+    for request in (hit, miss):
+        port.observe(request)
+
+    # SGLang matches when it admits, not when it receives, so the match
+    # appears between `observe` and `touch`.
+    hit.num_matched_prefix_tokens = 2
+    port.touch(hit)
+    port.touch(miss)
+
+    ratio = port.engine_facts()["hit_ratio_ppm"]
+    assert ratio == 250_000, f"the misses were left out of the denominator: {ratio}"
