@@ -189,6 +189,10 @@ class SchedulePolicy:
         # PLEX v2 stage-2 attach: a standing table replaces the built-in
         # ordering when one is installed. Off unless SGLANG_PLEX_SCHEDULE
         # is set; see plex_schedule.py.
+        if self.plex_schedule is not None:
+            # The one point per scheduling decision where the engine is
+            # asking for an order rather than consuming one.
+            self.plex_schedule.reload()
         if self.plex_schedule is not None and self.plex_schedule.installs:
             self.plex_schedule.apply(waiting_queue)
             return

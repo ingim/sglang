@@ -39,6 +39,7 @@ reports success.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import TYPE_CHECKING
 
@@ -49,11 +50,17 @@ if TYPE_CHECKING:
 class PlexSchedule:
     """A standing order over waiting requests."""
 
-    def __init__(self) -> None:
+    def __init__(self, source: str | None = None) -> None:
         # request id -> rank. Replaced wholesale on install: a table is a
         # document, not a stream of edits, so a partially-applied one is
         # not representable.
         self._rank: dict[str, int] = {}
+        # Where the policy's table arrives from. A path rather than a
+        # callback because the policy runs in the PLEX host, not in the
+        # engine: the engine must not import a runtime, block on one, or
+        # be able to fail because one is slow.
+        self._source = source if source else os.environ.get("SGLANG_PLEX_TABLE")
+        self._source_stamp: tuple[int, int] | None = None
         self._installs = 0
         self._seen: set[str] = set()
         self._arrivals = 0
@@ -64,6 +71,37 @@ class PlexSchedule:
         self._rank = {rid: rank for rank, rid in enumerate(order)}
         self._installs += 1
         self._installed_at_arrival = self._arrivals
+
+    def reload(self) -> None:
+        """Pick up a newly written table, if there is one.
+
+        Called from `calc_priority`, which is the moment the scheduler
+        asks for an order and is therefore provably not part-way through
+        consuming one. vLLM's port learned this the expensive way: a
+        reload inside `pop_request` re-sorted between the scheduler's
+        peek and its pop and crashed the engine with a `KeyError`. SGLang
+        sorts in one call, so the safe point is obvious here — but it is
+        the same rule, and it is the contract's own: a document must not
+        move under the thing reading it.
+
+        A table that is missing, unreadable or malformed leaves the
+        current one standing.
+        """
+        if not self._source:
+            return
+        try:
+            stat = os.stat(self._source)
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            if stamp == self._source_stamp:
+                return
+            with open(self._source, encoding="utf-8") as handle:
+                order = json.load(handle)
+            if not isinstance(order, list):
+                return
+            self._source_stamp = stamp
+        except (OSError, ValueError):
+            return
+        self.install([str(entry) for entry in order])
 
     @property
     def installs(self) -> int:
