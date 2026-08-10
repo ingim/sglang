@@ -64,6 +64,11 @@ class PlexObserver:
         self._arrivals = 0
         # Who was here last step, for deriving terminal edges.
         self._present: set[str] = set()
+        # Requests the engine has marked finished but which are still
+        # tracked. Departure is `absent AND finished`, never absent alone.
+        self._finishing: set[str] = set()
+        # Requests that vanished without finishing: retracted, not gone.
+        self._retracted: list[str] = []
         self._admitted: list[str] = []
 
     # ── the hooks ────────────────────────────────────────────────────────
@@ -98,14 +103,29 @@ class PlexObserver:
         tracked = self._tracked()
         present = {req.rid for req in tracked}
 
-        # Terminal edges, derived. A request that was here and is not has
-        # left; at the step boundary the reason is genuinely unknown, and
-        # saying `completed` when it may have been aborted would be a
-        # confident answer nobody observed.
-        departed = sorted(self._present - present)
+        # Terminal edges.
+        #
+        # Absence is *not* departure. A real run refuted that: SGLang
+        # retracts a request under memory pressure and puts it back, so
+        # one request vanished at step 80, returned at step 81, and a
+        # set-difference derivation reported it as finishing twice.
+        # Every accumulator in the corpus counts one departure as one.
+        #
+        # So absence is a *candidate*, and `req.finished()` — the
+        # engine's own answer — is what confirms it. A request that
+        # disappears without having finished has been retracted, and is
+        # remembered rather than mourned.
+        for req in tracked:
+            if getattr(req, "finished", None) is not None and req.finished():
+                self._finishing.add(req.rid)
+
+        gone = self._present - present
+        departed = sorted(rid for rid in gone if rid in self._finishing)
+        self._retracted = sorted(rid for rid in gone if rid not in self._finishing)
         self._present = present
         for rid in departed:
             self._arrival_seq.pop(rid, None)
+            self._finishing.discard(rid)
 
         document = {
             "step": self._step,

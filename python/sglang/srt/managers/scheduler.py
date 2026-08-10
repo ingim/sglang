@@ -1553,6 +1553,14 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
 
+            # PLEX v2 stage-1 attach: one document per scheduler step.
+            #
+            # Anchored on `last_batch` rather than `on_idle` because
+            # SGLang has two event loops and `event_loop_overlap` is the
+            # default. Hooking only the `on_idle` site in
+            # `event_loop_normal` attached cleanly, ran, changed nothing
+            # and observed nothing — a real run produced 0 steps. This
+            # boundary is the one both loops share.
             if self.plex_observer is not None:
                 self.plex_observer.emit_step()
 
@@ -1628,6 +1636,17 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+
+            # PLEX v2 stage-1 attach: one document per scheduler step.
+            #
+            # Anchored on `last_batch` rather than `on_idle` because
+            # SGLang has two event loops and `event_loop_overlap` is the
+            # default. Hooking only the `on_idle` site in
+            # `event_loop_normal` attached cleanly, ran, changed nothing
+            # and observed nothing — a real run produced 0 steps. This
+            # boundary is the one both loops share.
+            if self.plex_observer is not None:
+                self.plex_observer.emit_step()
 
             # Update last_batch
             self.last_batch = batch
