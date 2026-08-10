@@ -37,6 +37,7 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
+from sglang.srt.managers.plex_schedule import maybe_plex_schedule
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -177,6 +178,7 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.plex_schedule = maybe_plex_schedule()
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -184,6 +186,13 @@ class SchedulePolicy:
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
     ) -> None:
+        # PLEX v2 stage-2 attach: a standing table replaces the built-in
+        # ordering when one is installed. Off unless SGLANG_PLEX_SCHEDULE
+        # is set; see plex_schedule.py.
+        if self.plex_schedule is not None and self.plex_schedule.installs:
+            self.plex_schedule.apply(waiting_queue)
+            return
+
         policy = self._determine_active_policy(waiting_queue)
 
         # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
