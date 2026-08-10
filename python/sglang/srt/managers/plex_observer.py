@@ -61,6 +61,7 @@ class PlexObserver:
         self._step = 0
         # Arrival order, which nothing in SGLang records.
         self._arrival_seq: dict[str, int] = {}
+        self._arrival_ms: dict[str, int] = {}
         self._arrivals = 0
         # Who was here last step, for deriving terminal edges.
         self._present: set[str] = set()
@@ -82,6 +83,13 @@ class PlexObserver:
         rid = req.rid
         if rid not in self._arrival_seq:
             self._arrival_seq[rid] = self._arrivals
+            # SGLang records no wall-clock arrival the observer can read
+            # at this point, so it is taken here. That makes `arrival-ms`
+            # the moment the queue saw the request rather than the moment
+            # the server did — a difference of the request's own parsing,
+            # and one worth stating rather than letting a policy assume
+            # otherwise.
+            self._arrival_ms[rid] = int(time.time() * 1000)
             self._arrivals += 1
         self._admitted.append(rid)
 
@@ -141,17 +149,19 @@ class PlexObserver:
         self._present = present
         for rid in departed:
             self._arrival_seq.pop(rid, None)
+            self._arrival_ms.pop(rid, None)
             self._finishing.discard(rid)
 
+        document_now_ms = int(time.time() * 1000)
         document = {
             "step": self._step,
-            "now-ms": int(time.time() * 1000),
+            "now-ms": document_now_ms,
             "target": self._target,
             "subjects": {
                 "request": [req.rid for req in tracked],
                 "target": [self._target],
             },
-            "facts": self._facts(tracked),
+            "facts": self._facts(tracked, document_now_ms),
             "events": self._events(departed),
         }
         self._admitted.clear()
@@ -164,7 +174,7 @@ class PlexObserver:
         running = list(getattr(scheduler.running_batch, "reqs", []) or [])
         return [*scheduler.waiting_queue, *running]
 
-    def _facts(self, tracked: list[Req]) -> dict[str, dict[str, Any]]:
+    def _facts(self, tracked: list[Req], now_ms: int) -> dict[str, dict[str, Any]]:
         running_ids = {
             req.rid for req in getattr(self._scheduler.running_batch, "reqs", []) or []
         }
@@ -189,6 +199,19 @@ class PlexObserver:
                 "dispatch_input_tokens": {"num": max(prompt - cached, 0)},
                 "cached_tokens": {"num": cached},
                 "queue_member": {"flag": not running},
+                # Prefix-cache facts. vLLM cannot publish these from an
+                # observer — it computes hits inside `schedule()` and
+                # never keeps them on the request — but SGLang's radix
+                # tree answers per request, so where the engine knows it,
+                # the observer says so.
+                "uncached_tokens": {"num": max(prompt - cached, 0)},
+                "lpm_hit_tokens": {"num": cached},
+                "prefix_hit_ratio_ppm": {
+                    "num": min(cached * 1_000_000 // prompt, 1_000_000)
+                    if prompt
+                    else 0
+                },
+                "waiting_ms": {"num": max(now_ms - self._arrival_ms.get(req.rid, now_ms), 0)},
             }
         facts[self._target] = self._target_facts()
         return facts
@@ -198,11 +221,38 @@ class PlexObserver:
         running = getattr(scheduler.running_batch, "reqs", []) or []
         total = int(scheduler.max_total_num_tokens)
         free = int(scheduler.token_to_kv_pool_allocator.available_size())
+        max_running = int(scheduler.max_running_requests)
+        pending_decode = sum(
+            max(int(getattr(req.sampling_params, "max_new_tokens", 0) or 0)
+                - len(req.output_ids), 0)
+            for req in running
+        )
+        queued_tokens = sum(
+            len(req.origin_input_ids) for req in scheduler.waiting_queue
+        )
+        decoding = sum(1 for req in running if req.output_ids)
         return {
             "queue_depth": {"num": len(scheduler.waiting_queue)},
             "running_requests": {"num": len(running)},
             "batch_size": {"num": len(running)},
-            "max_batch_size": {"num": scheduler.max_running_requests},
+            "decode_batch_size": {"num": len(running)},
+            "max_batch_size": {"num": max_running},
+            # An alias the corpus reads under a second name.
+            "max_requests": {"num": max_running},
+            "free_decode_slots": {"num": max(max_running - len(running), 0)},
+            "pending_decode_tokens": {"num": pending_decode},
+            "queued_tokens": {"num": queued_tokens},
+            "decoder_ratio_ppm": {
+                "num": min(decoding * 1_000_000 // len(running), 1_000_000)
+                if running
+                else 0
+            },
+            "kv_overloaded": {"flag": free < total / 10},
+            "used_kv_ppm": {
+                "num": min((total - free) * 1_000_000 // total, 1_000_000)
+                if total
+                else 0
+            },
             # SGLang's allocator is already denominated in tokens, so
             # unlike vLLM there is no block-size conversion to do here.
             "total_kv_tokens": {"num": total},
