@@ -162,6 +162,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
+from sglang.srt.managers.plex_observer import maybe_plex_observer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -970,6 +971,10 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+
+        # PLEX v2 stage-1 attach: observation only, no influence. Off unless
+        # SGLANG_PLEX_OBSERVE names a sink; see plex_observer.py.
+        self.plex_observer = maybe_plex_observer(self)
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -1547,6 +1552,9 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
+
+            if self.plex_observer is not None:
+                self.plex_observer.emit_step()
 
             # Update last_batch
             self.last_batch = batch
@@ -2414,6 +2422,8 @@ class Scheduler(
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
+            if self.plex_observer is not None:
+                self.plex_observer.on_request_queued(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
