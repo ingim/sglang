@@ -68,8 +68,70 @@ UNSUPPORTED = "unsupported-on-this-engine"
 class PlexVerbs:
     """Staged verbs, enacted through SGLang's own primitives."""
 
+    @staticmethod
+    def maybe(scheduler: Scheduler) -> PlexVerbs | None:
+        """Attach verbs if a source was named, and otherwise cost nothing.
+
+        `SGLANG_PLEX_VERBS=/path/to/verbs.jsonl` — one staged verb per
+        line. A file rather than a callback, matching the table and
+        matching vLLM's port: the policy runs in the PLEX host and the
+        engine must not import a runtime, block on one, or be able to
+        fail because one is slow.
+        """
+        import os
+
+        if not os.environ.get("SGLANG_PLEX_VERBS"):
+            return None
+        return PlexVerbs(scheduler)
+
+    def drain(self) -> int:
+        """Enact everything staged since the last call.
+
+        **Call this between scheduling passes.** vLLM's port established
+        the rule the expensive way, twice: a read may happen mid-pass, a
+        write may not. `finish` mutates the waiting queue and the running
+        batch, which are what a pass consumes.
+
+        A cursor over a log rather than a whole document, unlike the
+        table — a verb is an instruction, and replaying one would finish
+        a request twice.
+        """
+        import json
+        import os
+
+        path = os.environ.get("SGLANG_PLEX_VERBS")
+        if not path:
+            return 0
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return 0
+        if len(lines) <= self._drained:
+            return 0
+
+        applied = 0
+        for line in lines[self._drained :]:
+            try:
+                staged = json.loads(line)
+                verb = str(staged["verb"])
+                subject = str(staged["subject"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            kwargs = {
+                key: value
+                for key, value in staged.items()
+                if key not in ("verb", "subject")
+            }
+            if self.enact(verb, subject, **kwargs):
+                applied += 1
+        self._drained = len(lines)
+        return applied
+
     def __init__(self, scheduler: Scheduler) -> None:
         self._scheduler = scheduler
+        # How much of the staged file has already been enacted.
+        self._drained = 0
         self._refusals: list[Refusal] = []
 
     def take_refusals(self) -> list[Refusal]:

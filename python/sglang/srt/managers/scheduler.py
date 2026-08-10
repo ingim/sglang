@@ -2734,6 +2734,15 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        # PLEX v2 stage-3 attach: staged verbs, applied before the pass.
+        #
+        # Here rather than at the observer's step hook, because a read may
+        # happen mid-pass and a write may not. vLLM's port established
+        # that by crashing twice; `finish` mutates the same queues this
+        # function is about to consume.
+        if self.plex_observer is not None:
+            self.plex_observer.drain_verbs()
+
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:

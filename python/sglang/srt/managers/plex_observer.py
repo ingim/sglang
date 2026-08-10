@@ -70,6 +70,10 @@ class PlexObserver:
         # Requests that vanished without finishing: retracted, not gone.
         self._retracted: list[str] = []
         self._admitted: list[str] = []
+        # Stage 3, if a source was named.
+        from sglang.srt.managers.plex_verbs import PlexVerbs
+
+        self._verbs = PlexVerbs.maybe(scheduler)
 
     # ── the hooks ────────────────────────────────────────────────────────
 
@@ -96,6 +100,18 @@ class PlexObserver:
         except Exception:  # noqa: BLE001 - see docstring
             self._sink = None
             self._scheduler.plex_observer = None
+
+    def drain_verbs(self) -> int:
+        """Enact staged verbs. Called before a scheduling pass begins.
+
+        Separate from the step document for the reason vLLM's port
+        learned by crashing twice: a read may happen mid-pass and a write
+        may not. SGLang's loop is structured differently, but `finish`
+        mutates the same queues a pass consumes, so the rule holds.
+        """
+        if self._verbs is None:
+            return 0
+        return self._verbs.drain()
 
     def on_step(self) -> str:
         """One scheduler step, as a document the port reads."""
