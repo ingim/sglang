@@ -62,6 +62,11 @@ class PlexObserver:
         # Arrival order, which nothing in SGLang records.
         self._arrival_seq: dict[str, int] = {}
         self._arrival_ms: dict[str, int] = {}
+        # How many eviction candidates to offer per step. Bounded for the
+        # same reason as on vLLM: the cost of describing pages must stay
+        # proportional to how many the engine is about to touch.
+        self._page_budget = int(os.environ.get("SGLANG_PLEX_PAGE_BUDGET", "64"))
+        self._offered_last: set[str] = set()
         self._arrivals = 0
         # Who was here last step, for deriving terminal edges.
         self._present: set[str] = set()
@@ -157,10 +162,7 @@ class PlexObserver:
             "step": self._step,
             "now-ms": document_now_ms,
             "target": self._target,
-            "subjects": {
-                "request": [req.rid for req in tracked],
-                "target": [self._target],
-            },
+            "subjects": self._subjects(tracked),
             "facts": self._facts(tracked, document_now_ms),
             "events": self._events(departed),
         }
@@ -213,6 +215,17 @@ class PlexObserver:
                 },
                 "waiting_ms": {"num": max(now_ms - self._arrival_ms.get(req.rid, now_ms), 0)},
             }
+        for page_id, node in self._offered_pages():
+            value = getattr(node, "value", None)
+            facts[page_id] = {
+                "resident": {"flag": True},
+                "targets": {"ids": [self._target]},
+                "tier": {"text": "gpu"},
+                # `lock_ref` is the tree's own "someone is using this".
+                "pinned": {"flag": int(getattr(node, "lock_ref", 0) or 0) > 0},
+                "page-tokens": {"num": len(value) if value is not None else 0},
+                "leaf": {"flag": True},
+            }
         facts[self._target] = self._target_facts()
         return facts
 
@@ -223,7 +236,8 @@ class PlexObserver:
         free = int(scheduler.token_to_kv_pool_allocator.available_size())
         max_running = int(scheduler.max_running_requests)
         pending_decode = sum(
-            max(int(getattr(req.sampling_params, "max_new_tokens", 0) or 0)
+            max(int(getattr(getattr(req, "sampling_params", None),
+                            "max_new_tokens", 0) or 0)
                 - len(req.output_ids), 0)
             for req in running
         )
@@ -260,8 +274,61 @@ class PlexObserver:
             "max_total_tokens": {"num": total},
         }
 
+    def _subjects(self, tracked: list[Req]) -> dict[str, Any]:
+        subjects: dict[str, Any] = {
+            "request": [req.rid for req in tracked],
+            "target": [self._target],
+        }
+        pages = self._offered_pages()
+        if pages:
+            subjects["page"] = [page_id for page_id, _ in pages]
+        return subjects
+
+    def _offered_pages(self) -> list[tuple[str, Any]]:
+        """Radix nodes that are candidates for eviction, coldest first.
+
+        **Offered, not enumerated**, exactly as on vLLM. A snapshot of
+        the whole tree is per-node state on every step, which is a
+        different order of cost from the per-request scrape, and it hands
+        a policy thousands of subjects when a handful are in play.
+
+        `evictable_leaves` ordered by the cache's own
+        `eviction_strategy` is SGLang's answer to "what goes next", so
+        reading it is reading the answer rather than modelling it.
+
+        Only leaves, and that is the tree's own rule rather than a
+        simplification: evicting an interior node orphans everything
+        below it, so a policy that could name one could express a plan
+        the engine must refuse.
+        """
+        cache = getattr(self._scheduler, "tree_cache", None)
+        leaves = getattr(cache, "evictable_leaves", None)
+        if not leaves:
+            return []
+        strategy = getattr(cache, "eviction_strategy", None)
+        nodes = list(leaves)
+        if strategy is not None and hasattr(strategy, "get_priority"):
+            try:
+                nodes.sort(key=strategy.get_priority)
+            except (TypeError, ValueError):
+                pass
+        offered: list[tuple[str, Any]] = []
+        for node in nodes[: self._page_budget]:
+            node_id = getattr(node, "id", None)
+            if node_id is None:
+                continue
+            offered.append((f"p{int(node_id):08x}", node))
+        return offered
+
     def _events(self, departed: list[str]) -> dict[str, Any]:
         events: dict[str, Any] = {}
+        offered = [page_id for page_id, _ in self._offered_pages()]
+        # Once per page, not once per step: every accumulator in the
+        # corpus counts one offer as one.
+        fresh = [page_id for page_id in offered if page_id not in self._offered_last]
+        if fresh:
+            events["offered"] = fresh
+        self._offered_last = set(offered)
         if self._admitted:
             events["admitted"] = list(self._admitted)
         if departed:
