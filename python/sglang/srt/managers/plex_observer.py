@@ -66,6 +66,17 @@ class PlexObserver:
         # same reason as on vLLM: the cost of describing pages must stay
         # proportional to how many the engine is about to touch.
         self._page_budget = int(os.environ.get("SGLANG_PLEX_PAGE_BUDGET", "64"))
+        # A short window of observed step durations, for the timing
+        # facts. Bounded so it tracks the engine's current behaviour
+        # rather than averaging over a run whose shape has changed.
+        self._step_ms_window: list[int] = []
+        self._last_step_ms: int | None = None
+        # Bytes of KV per token. Declared rather than guessed: it depends
+        # on the model's layers, heads and dtype, and a port that assumed
+        # one would publish a confident byte count for a different model.
+        self._bytes_per_token = int(
+            os.environ.get("SGLANG_PLEX_BYTES_PER_TOKEN", "0")
+        )
         self._offered_last: set[str] = set()
         self._arrivals = 0
         # Who was here last step, for deriving terminal edges.
@@ -75,6 +86,10 @@ class PlexObserver:
         self._finishing: set[str] = set()
         # Requests that vanished without finishing: retracted, not gone.
         self._retracted: list[str] = []
+        # Every request ever retracted, for `preempted`. Separate from
+        # `_retracted` (this step's) because the fact is "has been", not
+        # "is being".
+        self._retracted_ever: set[str] = set()
         self._admitted: list[str] = []
         # Stage 3, if a source was named.
         from sglang.srt.managers.plex_verbs import PlexVerbs
@@ -151,6 +166,7 @@ class PlexObserver:
         gone = self._present - present
         departed = sorted(rid for rid in gone if rid in self._finishing)
         self._retracted = sorted(rid for rid in gone if rid not in self._finishing)
+        self._retracted_ever.update(self._retracted)
         self._present = present
         for rid in departed:
             self._arrival_seq.pop(rid, None)
@@ -158,6 +174,11 @@ class PlexObserver:
             self._finishing.discard(rid)
 
         document_now_ms = int(time.time() * 1000)
+        if self._last_step_ms is not None:
+            self._step_ms_window.append(max(document_now_ms - self._last_step_ms, 0))
+            if len(self._step_ms_window) > 32:
+                self._step_ms_window.pop(0)
+        self._last_step_ms = document_now_ms
         document = {
             "step": self._step,
             "now-ms": document_now_ms,
@@ -217,6 +238,14 @@ class PlexObserver:
                     else ("active" if running else "admitted")
                 },
                 "arrival_seq": {"num": self._arrival_seq.get(req.rid, 0)},
+                "arrival_ms": {"num": self._arrival_ms.get(req.rid, now_ms)},
+                # SGLang's retraction is its preemption: a request put
+                # back under memory pressure has been preempted, whatever
+                # the engine calls it. Derived from the observer's own
+                # record because SGLang keeps no counter — and stating it
+                # is better than leaving a policy to infer it from a
+                # request that mysteriously restarted.
+                "preempted": {"flag": req.rid in self._retracted_ever},
                 "prompt_tokens": {"num": prompt},
                 "generated_tokens": {"num": generated},
                 "computation_length": {"num": prompt + generated},
@@ -236,6 +265,11 @@ class PlexObserver:
                     else 0
                 },
                 "waiting_ms": {"num": max(now_ms - self._arrival_ms.get(req.rid, now_ms), 0)},
+                "current_queue_ms": {
+                    "num": 0
+                    if running
+                    else max(now_ms - self._arrival_ms.get(req.rid, now_ms), 0)
+                },
             }
         for page_id, node in self._offered_pages():
             value = getattr(node, "value", None)
@@ -251,12 +285,41 @@ class PlexObserver:
         facts[self._target] = self._target_facts()
         return facts
 
+
+    def _step_timing(self) -> tuple[int, int]:
+        """Median step wall clock, and the decode cost it implies.
+
+        **Measured here, not read from the engine.** Neither engine keeps
+        a per-step duration an observer can read — `forward_ct` is a
+        count — and the honest options were to publish nothing or to
+        measure. Publishing nothing loses four names the corpus reads;
+        inventing a plausible constant would hand a policy a confident
+        number about a machine nobody timed.
+
+        So the observer times its own steps and says so. It is the
+        *observer's* view of the step, which includes anything else the
+        engine did between two documents — and that is the quantity a
+        policy reasoning about "how long until my turn" actually wants.
+
+        Median over a short window rather than a mean: one slow step
+        (a cold kernel, a neighbour on the GPU) would drag a mean for
+        many steps afterwards, and a policy acting on it would be acting
+        on an outlier that has already passed.
+        """
+        if len(self._step_ms_window) < 3:
+            return (0, 0)
+        window = sorted(self._step_ms_window)
+        median = window[len(window) // 2]
+        return (median, median * 1000)
+
     def _target_facts(self) -> dict[str, Any]:
         scheduler = self._scheduler
         running = getattr(scheduler.running_batch, "reqs", []) or []
         total = int(scheduler.max_total_num_tokens)
         free = int(scheduler.token_to_kv_pool_allocator.available_size())
         max_running = int(scheduler.max_running_requests)
+        queued = len(scheduler.waiting_queue)
+        step_ms, step_us = self._step_timing()
         pending_decode = sum(
             max(int(getattr(getattr(req, "sampling_params", None),
                             "max_new_tokens", 0) or 0)
@@ -284,6 +347,27 @@ class PlexObserver:
                 else 0
             },
             "kv_overloaded": {"flag": free < total / 10},
+            "step_ms": {"num": step_ms},
+            # Time per output token, from the observer's own timing. The
+            # engine keeps no such number, so this is measured rather
+            # than read — and it is the observer's view of a step, which
+            # is what a policy asking "how long until my turn" wants.
+            "decode_ms_per_token": {"num": step_ms},
+            "tpot_us": {"num": step_us},
+            # How long a newcomer waits: the requests ahead of it,
+            # divided by how many run at once, times a step.
+            "estimated_wait_ms": {
+                "num": ((queued + max_running - 1) // max_running) * step_ms if max_running else 0
+            },
+            # The pool in bytes as well as tokens. SGLang's allocator is
+            # denominated in tokens, so the conversion needs a per-token
+            # size the engine holds and the port does not.
+            "memory_capacity": {"num": total * self._bytes_per_token},
+            "active_kv_bytes": {"num": (total - free) * self._bytes_per_token},
+            "tiers": {"ids": ["gpu"]},
+            "throughput_token_cap": {
+                "num": int(getattr(scheduler, "max_prefill_tokens", 0) or 0)
+            },
             "used_kv_ppm": {
                 "num": min((total - free) * 1_000_000 // total, 1_000_000)
                 if total
