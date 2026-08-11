@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.plex_cache import PlexEviction
 
 """
 Copyright 2023-2024 SGLang Team
@@ -280,6 +281,9 @@ class TreeNode:
 class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
+        # SGLANG_PLEX_EVICT names a standing eviction order; see
+        # plex_cache.py. None unless asked for, like every other stage.
+        self.plex_eviction = PlexEviction.maybe()
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
@@ -569,8 +573,16 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
+        # SGLANG_PLEX_EVICT names a standing eviction order; see
+        # plex_cache.py. Overrides only the leaves a policy named; every
+        # other node keeps the priority the strategy computed.
+        plex = {}
+        if self.plex_eviction is not None:
+            self.plex_eviction.reload()
+            plex = self.plex_eviction.priorities(leaves)
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (plex.get(id(node), self.eviction_strategy.get_priority(node)), node)
+            for node in leaves
         ]
         heapq.heapify(eviction_heap)
 

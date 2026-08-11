@@ -51,6 +51,24 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+def _page_id(node_id: Any) -> str:
+    """A page's name, from the radix node's own id.
+
+    SGLang's node ids are integers from a counter, so they are stable
+    for as long as the node lives and mean nothing across a restart --
+    which is the right property here, because a radix node *is* a
+    per-process object. vLLM's equivalent had to be derived from content
+    bytes because `hash()` of `bytes` is randomised per interpreter and
+    the id read as content-addressed while being process-addressed.
+
+    Defined here and imported by `plex_cache` rather than copied. A
+    second copy is how the referent gets lost: a policy naming a page
+    that resolves to nothing is indistinguishable from a policy that
+    agrees with the engine.
+    """
+    return f"p{int(node_id):08x}"
+
+
 class PlexObserver:
     """One SGLang scheduler, in the contract's vocabulary. Holds no policy."""
 
@@ -423,7 +441,7 @@ class PlexObserver:
             node_id = getattr(node, "id", None)
             if node_id is None:
                 continue
-            offered.append((f"p{int(node_id):08x}", node))
+            offered.append((_page_id(node_id), node))
         return offered
 
     def _events(self, departed: list[str]) -> dict[str, Any]:
