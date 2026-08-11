@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -61,8 +62,36 @@ class PlexSchedule:
         # be able to fail because one is slow.
         self._source = source if source else os.environ.get("SGLANG_PLEX_TABLE")
         self._source_stamp: tuple[int, int] | None = None
+
+        # ── admission hold (the route channel) ───────────────────────────
+        #
+        # SGLang appends a request straight onto `waiting_queue`, so there
+        # is no moment at which one has arrived and not yet been admitted
+        # — and a gate with nothing pending has nothing to rule on.
+        # Holding arrivals creates that moment. It is a behaviour change
+        # and therefore stage 2, exactly as on vLLM.
+        self._gate = os.environ.get("SGLANG_PLEX_GATE")
+        self._held: dict[str, tuple[Req, float]] = {}
+        self._verdict_stamp: tuple[int, int] | None = None
+        # The declared default: admit. A policy that does not answer must
+        # not change what the engine would have done, so silence and
+        # slowness produce the same behaviour.
+        #
+        # SGLang needs no equivalent of vLLM's `has_requests` clause: its
+        # event loop is a `while True` that receives and steps regardless
+        # of whether there is work, so the deadline advances even with
+        # every arrival held. vLLM quiesces, which is why holding there
+        # hung a real engine until the loop was told that a held request
+        # is pending work.
+        self._hold_ms = float(os.environ.get("SGLANG_PLEX_GATE_MS", "50"))
+        self.released_by_deadline = 0
+        self.rejected_by_policy: list[str] = []
         self._installs = 0
         self._seen: set[str] = set()
+        # Requests the gate has already ruled on, so a released request
+        # is not immediately re-held.
+        self._ruled: set[str] = set()
+        self._to_release: list[tuple[str, Req]] = []
         self._arrivals = 0
         self._installed_at_arrival = 0
 
@@ -117,6 +146,90 @@ class PlexSchedule:
         rather than silently obeyed.
         """
         return self._arrivals - self._installed_at_arrival
+
+    def hold_arrivals(self, waiting_queue: list[Req]) -> None:
+        """Move newly-arrived requests into the hold, and release rulings.
+
+        Called from `calc_priority`, which is where the scheduler hands
+        over the queue and is therefore the one point per pass that can
+        change what is in it without racing the scheduler's own
+        iteration. vLLM's port established that rule the expensive way.
+        """
+        if not self._gate:
+            return
+        self._pick_up_verdicts()
+
+        now = time.monotonic()
+        # Anything not yet ruled on goes into the hold and out of the
+        # queue. `_seen` is the record of what the gate has been offered,
+        # so a released request is not re-held on the next pass.
+        for req in list(waiting_queue):
+            if req.rid in self._held or req.rid in self._ruled:
+                continue
+            self._held[req.rid] = (req, now)
+            waiting_queue.remove(req)
+
+        # Deadline: admit anything held too long.
+        expired = [
+            rid for rid, (_, since) in self._held.items()
+            if (now - since) * 1000.0 >= self._hold_ms
+        ]
+        for rid in expired:
+            req, _ = self._held.pop(rid)
+            self._ruled.add(rid)
+            waiting_queue.append(req)
+            self.released_by_deadline += 1
+
+        for rid, req in self._to_release:
+            waiting_queue.append(req)
+        self._to_release.clear()
+
+    def held_requests(self) -> list[Req]:
+        """Requests awaiting a verdict — the contract's `pending`."""
+        return [req for req, _ in self._held.values()]
+
+    def _pick_up_verdicts(self) -> None:
+        """Apply verdicts the policy has written.
+
+        `{"request-id": "assign"|"defer"|"reject"}`. A verdict naming a
+        request this engine does not hold is ignored: a policy ruling on
+        someone else's world has stale beliefs, and acting on it would
+        make those beliefs true.
+        """
+        if not self._gate:
+            return
+        try:
+            stat = os.stat(self._gate)
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            if stamp == self._verdict_stamp:
+                return
+            with open(self._gate, encoding="utf-8") as handle:
+                verdicts = json.load(handle)
+            if not isinstance(verdicts, dict):
+                return
+            self._verdict_stamp = stamp
+        except (OSError, ValueError):
+            return
+
+        for rid, verdict in verdicts.items():
+            entry = self._held.get(str(rid))
+            if entry is None:
+                continue
+            req, _ = entry
+            if verdict == "assign":
+                del self._held[str(rid)]
+                self._ruled.add(str(rid))
+                self._to_release.append((str(rid), req))
+            elif verdict == "reject":
+                # Released *and* recorded, not dropped. A refusal is a
+                # kind of ending, not a kind of forgetting: a request
+                # that vanishes without an outcome leaves its caller
+                # waiting forever, which vLLM's port learned by hanging.
+                del self._held[str(rid)]
+                self._ruled.add(str(rid))
+                self._to_release.append((str(rid), req))
+                self.rejected_by_policy.append(str(rid))
+            # `defer` keeps it held, which is what `defer` means.
 
     def apply(self, waiting_queue: list[Req]) -> None:
         """Sort the queue by the table, in place.

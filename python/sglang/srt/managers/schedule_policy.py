@@ -193,6 +193,9 @@ class SchedulePolicy:
             # The one point per scheduling decision where the engine is
             # asking for an order rather than consuming one.
             self.plex_schedule.reload()
+            # And the one point that can change what is *in* the queue
+            # without racing the scheduler's own iteration of it.
+            self.plex_schedule.hold_arrivals(waiting_queue)
         if self.plex_schedule is not None and self.plex_schedule.installs:
             self.plex_schedule.apply(waiting_queue)
             return

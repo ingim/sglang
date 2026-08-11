@@ -171,15 +171,29 @@ class PlexObserver:
 
     # ── scraping ─────────────────────────────────────────────────────────
 
+    def _held_requests(self) -> list[Req]:
+        """Requests the gate is holding, which the scheduler cannot see.
+
+        They are out of `waiting_queue` on purpose — that is what the
+        hold is — so the observer has to reach the holder to describe
+        them. Without this the gate would be offered no subject, which is
+        exactly how `llumnix` came to be called and decide nothing.
+        """
+        policy = getattr(self._scheduler, "policy", None)
+        schedule = getattr(policy, "plex_schedule", None)
+        held = getattr(schedule, "held_requests", None)
+        return list(held()) if held is not None else []
+
     def _tracked(self) -> list[Req]:
         scheduler = self._scheduler
         running = list(getattr(scheduler.running_batch, "reqs", []) or [])
-        return [*scheduler.waiting_queue, *running]
+        return [*self._held_requests(), *scheduler.waiting_queue, *running]
 
     def _facts(self, tracked: list[Req], now_ms: int) -> dict[str, dict[str, Any]]:
         running_ids = {
             req.rid for req in getattr(self._scheduler.running_batch, "reqs", []) or []
         }
+        held_ids = {req.rid for req in self._held_requests()}
         facts: dict[str, dict[str, Any]] = {}
         for req in tracked:
             running = req.rid in running_ids
@@ -193,14 +207,22 @@ class PlexObserver:
             # rather than `len(prefix_indices)`, which misses the host half.
             cached = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
             facts[req.rid] = {
-                "state": {"text": "active" if running else "admitted"},
+                # `pending` only while genuinely held out of the queue.
+                # Publishing it for a queued request would be a lie: the
+                # engine has already accepted that one, and a policy
+                # answering `reject` would rule on something admitted.
+                "state": {
+                    "text": "pending"
+                    if req.rid in held_ids
+                    else ("active" if running else "admitted")
+                },
                 "arrival_seq": {"num": self._arrival_seq.get(req.rid, 0)},
                 "prompt_tokens": {"num": prompt},
                 "generated_tokens": {"num": generated},
                 "computation_length": {"num": prompt + generated},
                 "dispatch_input_tokens": {"num": max(prompt - cached, 0)},
                 "cached_tokens": {"num": cached},
-                "queue_member": {"flag": not running},
+                "queue_member": {"flag": not running and req.rid not in held_ids},
                 # Prefix-cache facts. vLLM cannot publish these from an
                 # observer — it computes hits inside `schedule()` and
                 # never keeps them on the request — but SGLang's radix
