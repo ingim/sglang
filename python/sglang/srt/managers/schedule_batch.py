@@ -1277,6 +1277,18 @@ class Req(ReqDllmMixin):
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
+            # The only place the reuse is known: what the tree returned,
+            # before the request computes anything on top of it.
+            try:
+                from sglang.srt.managers.plex_observer import note_match
+
+                note_match(
+                    self.rid,
+                    len(self.prefix_indices) + int(self.host_hit_length or 0),
+                )
+            except ImportError:
+                pass
+
         if (
             self.is_retracted
             and self.multimodal_inputs is not None

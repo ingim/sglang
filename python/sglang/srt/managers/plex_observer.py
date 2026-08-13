@@ -51,6 +51,32 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+# The prefix match as the engine first stated it, per request.
+#
+# It cannot be read off a request when the observer samples one. SGLang
+# publishes a request only once it is already running, and by then
+# `prefix_indices` covers everything the request has computed, not
+# everything it reused -- a hit rate summed from that reads 0.9990 on a
+# baseline arm, which is a clock started after the race, not a cache
+# working perfectly. And `num_matched_prefix_tokens` is not a fallback:
+# it is populated at schedule time and SGLang stops populating it above
+# 128 queued requests, which is inside the regime under test.
+#
+# So it is recorded where it is true: at the one call that asks the
+# radix tree, and only the first time for a request.
+FIRST_MATCH: dict[str, int] = {}
+FIRST_MATCH_LIMIT = 65536
+
+
+def note_match(rid: str, matched_tokens: int) -> None:
+    """Record the engine's own answer to "how much of this did you already have"."""
+    if rid in FIRST_MATCH:
+        return
+    if len(FIRST_MATCH) >= FIRST_MATCH_LIMIT:
+        FIRST_MATCH.clear()
+    FIRST_MATCH[rid] = int(matched_tokens)
+
+
 def _page_id(node_id: Any) -> str:
     """A page's name, from the radix node's own id.
 
@@ -96,6 +122,10 @@ class PlexObserver:
             os.environ.get("SGLANG_PLEX_BYTES_PER_TOKEN", "0")
         )
         self._offered_last: set[str] = set()
+        # Branch demand, computed once per step: every offered page asks
+        # the same question of the same queue.
+        self._demand: dict[int, set[str]] = {}
+        self._demand_step = -1
         self._arrivals = 0
         # Who was here last step, for deriving terminal edges.
         self._present: set[str] = set()
@@ -245,6 +275,9 @@ class PlexObserver:
             # the field SGLang itself uses to estimate uncached tokens,
             # rather than `len(prefix_indices)`, which misses the host half.
             cached = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
+            # The engine's stated match, kept apart from the total
+            # above. Recorded at the match itself; see `note_match`.
+            stated = FIRST_MATCH.get(req.rid, 0)
             # `len` and not truthiness: `prefix_indices` is a tensor, and
             # `x or ()` on a tensor with more than one element raises
             # rather than falling back.
@@ -318,23 +351,67 @@ class PlexObserver:
                     "dispatch_input_tokens": {"num": max(prompt - cached, 0)},
                     "cached_tokens": {"num": cached},
                     "uncached_tokens": {"num": max(prompt - cached, 0)},
-                    "lpm_hit_tokens": {"num": cached},
+                    "lpm_hit_tokens": {"num": stated},
                     "prefix_hit_ratio_ppm": {
                         "num": min(cached * 1_000_000 // prompt, 1_000_000)
                         if prompt
                         else 0
                     },
                 })
+        # The facts a cache policy ranks on, and they were absent.
+        #
+        # SGLang published six: resident, targets, tier, pinned,
+        # page-tokens and leaf. None of them says how recently a page was
+        # touched or how often, so `hotprefix` -- whose whole kernel is
+        # hotness -- read `unknown-key` for every page, scored them
+        # identically, and would have installed the offer's own order
+        # under a different name. The tree already holds all of it:
+        # `last_access_time` and `hit_count` are TreeNode fields, and the
+        # radix structure gives the prefix and its beneficiaries directly,
+        # which on vLLM's flat pool had to be reconstructed.
+        now_monotonic = time.monotonic()
         for page_id, node in self._offered_pages():
             value = getattr(node, "value", None)
+            tokens = len(value) if value is not None else 0
+            last_access = getattr(node, "last_access_time", None)
             facts[page_id] = {
                 "resident": {"flag": True},
                 "targets": {"ids": [self._target]},
                 "tier": {"text": "gpu"},
                 # `lock_ref` is the tree's own "someone is using this".
                 "pinned": {"flag": int(getattr(node, "lock_ref", 0) or 0) > 0},
-                "page-tokens": {"num": len(value) if value is not None else 0},
+                "page-tokens": {"num": tokens},
+                # The same number under the name the ports read. vLLM
+                # publishes both and the corpus is split over which it
+                # asks for.
+                "size-tokens": {"num": tokens},
                 "leaf": {"flag": True},
+                # Wall clock, because that is what the fact name promises
+                # and what every port compares against `now-ms`.
+                # `last_access_time` is monotonic, so it is carried back
+                # to the same origin rather than published raw.
+                **(
+                    {
+                        "last-access-ms": {
+                            "num": max(
+                                now_ms - int((now_monotonic - last_access) * 1000),
+                                0,
+                            )
+                        }
+                    }
+                    if last_access is not None
+                    else {}
+                ),
+                "hit-count": {"num": int(getattr(node, "hit_count", 0) or 0)},
+                # The prefix this page belongs to: the root of its branch,
+                # which is what survives the page. SGLang has a tree, so
+                # this is a walk rather than the side table vLLM needs.
+                "prefix": {"text": self._prefix_of(node, page_id)},
+                # Who wants it. The requests currently holding a lock on
+                # this branch -- `lock_ref` is the tree's own count of
+                # them, and the ids come from the requests whose last
+                # matched node is at or below here.
+                "beneficiaries": {"ids": self._wanted_by(node)},
             }
         facts[self._target] = self._target_facts()
         return facts
@@ -479,6 +556,58 @@ class PlexObserver:
                 continue
             offered.append((_page_id(node_id), node))
         return offered
+
+    def _prefix_of(self, node: Any, page_id: str) -> str:
+        """The root of this node's branch, as a page id.
+
+        A page id names a page and a page dies when the engine takes it;
+        a prefix outlives its pages, so a policy that wants a prefix kept
+        names this instead. vLLM has to keep a side table to answer it
+        because its pool is flat. The radix tree answers it by walking.
+        """
+        current = node
+        seen = 0
+        while seen < 4096:
+            parent = getattr(current, "parent", None)
+            if parent is None or getattr(parent, "parent", None) is None:
+                break
+            current = parent
+            seen += 1
+        node_id = getattr(current, "id", None)
+        return _page_id(node_id) if node_id is not None else page_id
+
+    def _wanted_by(self, node: Any) -> list[str]:
+        """The requests whose matched prefix runs through this node.
+
+        Demand, not authorship -- the distinction that cost the vLLM port
+        three runs. A request's `last_node` is where its match ended, so
+        every node on the path from there to the root is a node that
+        request is currently relying on.
+        """
+        wanted = self._branch_demand()
+        return sorted(wanted.get(id(node), ()))
+
+    def _branch_demand(self) -> dict[int, set[str]]:
+        """Per step, because every offered page asks the same question."""
+        if self._demand_step == self._step:
+            return self._demand
+        demand: dict[int, set[str]] = {}
+        batch = getattr(self._scheduler, "running_batch", None)
+        pending = list(getattr(batch, "reqs", []) or [])
+        pending.extend(getattr(self._scheduler, "waiting_queue", []) or [])
+        for req in pending:
+            node = getattr(req, "last_node", None)
+            rid = getattr(req, "rid", None)
+            if node is None or rid is None:
+                continue
+            seen = 0
+            while node is not None and seen < 4096:
+                demand.setdefault(id(node), set()).add(rid)
+                node = getattr(node, "parent", None)
+                seen += 1
+        self._demand = demand
+        self._demand_step = self._step
+        return demand
 
     def _events(self, departed: list[str]) -> dict[str, Any]:
         events: dict[str, Any] = {}
