@@ -245,6 +245,38 @@ class PlexObserver:
             # the field SGLang itself uses to estimate uncached tokens,
             # rather than `len(prefix_indices)`, which misses the host half.
             cached = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
+            # `len` and not truthiness: `prefix_indices` is a tensor, and
+            # `x or ()` on a tensor with more than one element raises
+            # rather than falling back.
+            device_hit = getattr(req, "prefix_indices", None)
+            if device_hit is not None:
+                cached = max(cached, len(device_hit))
+            # Whether the engine looked, not whether it found anything.
+            #
+            # `num_matched_prefix_tokens` is populated at schedule time
+            # and SGLang stops populating it under load: LPM is its
+            # default policy and `_determine_active_policy` degrades to
+            # FCFS once the waiting queue passes 128, while the
+            # cache-agnostic fallback path is gated on
+            # `supports_fast_match_prefix()`, which no cache in this
+            # tree overrides to True. So above 128 queued requests
+            # nothing computes the match.
+            #
+            # 128 is inside the regime `v2/host/src/load.rs` requires.
+            # Measured on a two-replica 14B fleet at mean queue depth
+            # 80: every one of 89,196 step documents published
+            # `cached_tokens` 0, while the engine's own Prometheus
+            # counter reported a 53% hit rate over the same run. The
+            # observer was not reporting an absence of hits, it was
+            # reporting an absence of measurement in the words of a
+            # measurement -- and precisely when the load qualifies.
+            #
+            # A fact the engine has not computed is not a fact, so it is
+            # not published. `last_node` is the discriminator: it is
+            # None until a match is attempted and a node afterwards.
+            matched = (
+                getattr(req, "last_node", None) is not None or cached > 0
+            )
             facts[req.rid] = {
                 # `pending` only while genuinely held out of the queue.
                 # Publishing it for a queued request would be a lie: the
@@ -267,21 +299,7 @@ class PlexObserver:
                 "prompt_tokens": {"num": prompt},
                 "generated_tokens": {"num": generated},
                 "computation_length": {"num": prompt + generated},
-                "dispatch_input_tokens": {"num": max(prompt - cached, 0)},
-                "cached_tokens": {"num": cached},
                 "queue_member": {"flag": not running and req.rid not in held_ids},
-                # Prefix-cache facts. vLLM cannot publish these from an
-                # observer — it computes hits inside `schedule()` and
-                # never keeps them on the request — but SGLang's radix
-                # tree answers per request, so where the engine knows it,
-                # the observer says so.
-                "uncached_tokens": {"num": max(prompt - cached, 0)},
-                "lpm_hit_tokens": {"num": cached},
-                "prefix_hit_ratio_ppm": {
-                    "num": min(cached * 1_000_000 // prompt, 1_000_000)
-                    if prompt
-                    else 0
-                },
                 "waiting_ms": {"num": max(now_ms - self._arrival_ms.get(req.rid, now_ms), 0)},
                 "current_queue_ms": {
                     "num": 0
@@ -289,6 +307,24 @@ class PlexObserver:
                     else max(now_ms - self._arrival_ms.get(req.rid, now_ms), 0)
                 },
             }
+            # Prefix-cache facts, and only where the engine computed
+            # one. vLLM cannot publish these from an observer at all --
+            # it computes hits inside `schedule()` and never keeps them
+            # on the request -- and SGLang's radix tree answers per
+            # request only when something asked it. Where nothing asked,
+            # the observer says nothing rather than saying zero.
+            if matched:
+                facts[req.rid].update({
+                    "dispatch_input_tokens": {"num": max(prompt - cached, 0)},
+                    "cached_tokens": {"num": cached},
+                    "uncached_tokens": {"num": max(prompt - cached, 0)},
+                    "lpm_hit_tokens": {"num": cached},
+                    "prefix_hit_ratio_ppm": {
+                        "num": min(cached * 1_000_000 // prompt, 1_000_000)
+                        if prompt
+                        else 0
+                    },
+                })
         for page_id, node in self._offered_pages():
             value = getattr(node, "value", None)
             facts[page_id] = {
