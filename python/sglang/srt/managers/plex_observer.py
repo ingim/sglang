@@ -509,6 +509,20 @@ class PlexObserver:
             "total_kv_tokens": {"num": total},
             "free_kv_tokens": {"num": free},
             "max_total_tokens": {"num": total},
+            # The engine's own count of what it could evict, *before*
+            # the page budget truncates the offer.
+            #
+            # Published so that a narrow offer can be attributed. A
+            # policy handed one candidate per step reads identically
+            # whether the tree had one to give or the observer chose to
+            # publish one, and those are a fact about SGLang and a bug
+            # in this file respectively. `RadixCache.evict` builds its
+            # heap over exactly this set, so it is the engine's answer
+            # to the same question rather than a model of it.
+            "evictable_leaves": {"num": len(
+                getattr(getattr(self._scheduler, "tree_cache", None),
+                        "evictable_leaves", None) or ()
+            )},
         }
 
     def _subjects(self, tracked: list[Req]) -> dict[str, Any]:
