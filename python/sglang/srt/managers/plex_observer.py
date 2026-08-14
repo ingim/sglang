@@ -699,6 +699,31 @@ class PlexObserver:
         median = window[len(window) // 2]
         return (median, median * 1000)
 
+    def _table_staleness(self) -> dict[str, Any]:
+        """How old the installed order is, when there is one.
+
+        The counter has existed on both engines since their tables were
+        written and neither ever surfaced it — the same shape of defect
+        as the verbs nobody carried, and found for the same reason: a
+        number that could have answered a question nobody had yet asked.
+
+        Absent when nothing is installed, because zero would read as
+        "perfectly fresh" to anything reporting a mean, and an FCFS arm
+        has no table rather than a maximally fresh one.
+        """
+        policy = getattr(self._scheduler, "policy", None)
+        schedule = getattr(policy, "plex_schedule", None)
+        if schedule is None:
+            return {}
+        age = getattr(schedule, "table_age", None)
+        installs = getattr(schedule, "installs", None)
+        if age is None or installs is None or installs == 0:
+            return {}
+        return {
+            "table_age_arrivals": {"num": int(age)},
+            "table_installs": {"num": int(installs)},
+        }
+
     def _target_facts(self) -> dict[str, Any]:
         scheduler = self._scheduler
         running = getattr(scheduler.running_batch, "reqs", []) or []
@@ -719,6 +744,7 @@ class PlexObserver:
         decoding = sum(1 for req in running if req.output_ids)
         return {
             "queue_depth": {"num": len(scheduler.waiting_queue)},
+            **self._table_staleness(),
             "running_requests": {"num": len(running)},
             "batch_size": {"num": len(running)},
             "decode_batch_size": {"num": len(running)},
