@@ -68,6 +68,44 @@ FIRST_MATCH: dict[str, int] = {}
 FIRST_MATCH_LIMIT = 65536
 
 
+def _strip_engine_prefix(head: str) -> str:
+    """The caller's own name, without an engine-added `cmpl-` prefix."""
+    for prefix in ("cmpl-", "chatcmpl-"):
+        if head.startswith(prefix):
+            return head[len(prefix):]
+    return head
+
+
+def _tenant_and_program(request_id: str) -> tuple[str, str]:
+    """Split the id's first field into a tenant and a program.
+
+    `[<tenant>@]<program>::<step>::...`, the same convention vLLM's
+    observer parses, so a policy sees the same partition on either
+    engine. Without the `@` the tenant is the program.
+    """
+    head, sep, _ = request_id.partition("::")
+    if not sep:
+        head = request_id
+    head = _strip_engine_prefix(head)
+    tenant, at, program = head.partition("@")
+    if not at:
+        return head, head
+    return tenant, program
+
+
+def _field_of(request_id: str, index: int) -> str:
+    """The nth `::`-separated field, or the last there is.
+
+    Degrading to a coarser level rather than to nothing: a workload that
+    names a user and no application should look like one application per
+    user, not like an absent fact a policy silently defaults.
+    """
+    parts = request_id.split("::")
+    if not parts:
+        return request_id
+    return parts[min(index, len(parts) - 1)]
+
+
 def note_match(rid: str, matched_tokens: int) -> None:
     """Record the engine's own answer to "how much of this did you already have"."""
     if rid in FIRST_MATCH:
@@ -321,6 +359,29 @@ class PlexObserver:
                     else ("active" if running else "admitted")
                 },
                 "arrival_seq": {"num": self._arrival_seq.get(req.rid, 0)},
+                # Who the request belongs to.
+                #
+                # SGLang published none of these. Every fairness policy
+                # in the corpus (`vtc`, `justitia`, `fairserve`) and
+                # every session policy (`parrot`, `saga`, `continuum`)
+                # ranks on exactly this and had nothing to rank on, so
+                # each of them scored every request identically here
+                # while scoring them apart on vLLM -- which reads as a
+                # policy that does not reproduce across engines, and is
+                # instead a port that does not ask the question.
+                #
+                # Parsed from the caller's own id with vLLM's rules, so
+                # the two engines hand a policy the same partition
+                # rather than two spellings of it.
+                "client_id": {"text": _tenant_and_program(req.rid)[0]},
+                "user_id": {"text": _tenant_and_program(req.rid)[0]},
+                "program-id": {"text": _tenant_and_program(req.rid)[1]},
+                # A group is a session: the run of requests one caller
+                # issues against a shared context, which is what the
+                # program field names.
+                "group": {"text": _tenant_and_program(req.rid)[1]},
+                "application_id": {"text": _field_of(req.rid, 1)},
+                "stage_id": {"text": _field_of(req.rid, 2)},
                 "arrival_ms": {"num": self._arrival_ms.get(req.rid, now_ms)},
                 # SGLang's retraction is its preemption: a request put
                 # back under memory pressure has been preempted, whatever
