@@ -95,6 +95,24 @@ def _page_id(node_id: Any) -> str:
     return f"p{int(node_id):08x}"
 
 
+# Mirrors of the two constants vLLM's port had to introduce, kept at the
+# same values so a cross-engine comparison is comparing engines and not
+# two different guesses about the cost of a token.
+#
+# `_MS_PER_PREFILL_TOKEN` is coarse on purpose: the policies that read it
+# compare recompute against swap, and swap is unavailable here, so the
+# comparison's outcome does not depend on the rate being accurate. The
+# falsifier is to vary it by two orders of magnitude and confirm the
+# disposition split does not move.
+_MS_PER_PREFILL_TOKEN = 0.05
+# Not "very expensive" — *unavailable*. SGLang retracts by recompute:
+# `retract_decode` releases the KV and restarts the request, and there is
+# no request-level CPU swap for a port to drive. A policy comparing
+# against an option that does not exist should get the same answer every
+# time, which a sentinel gives and a large guess does not.
+_NO_SWAP_MS = 1_000_000_000
+
+
 class PlexObserver:
     """One SGLang scheduler, in the contract's vocabulary. Holds no policy."""
 
@@ -139,6 +157,54 @@ class PlexObserver:
         # "is being".
         self._retracted_ever: set[str] = set()
         self._admitted: list[str] = []
+        # Cumulative engine time per request, in microseconds. Nothing in
+        # SGLang records it, and it is the fact the whole fair-share half
+        # of the corpus ranks on: `vtc`, `fairserve` and `dlpm` are all
+        # written about service received.
+        self._service_us: dict[str, int] = {}
+        # Output length last step, for the `progress` event. A policy
+        # that accumulates work per request needs an edge, not a level.
+        self._progress_last: dict[str, int] = {}
+        # One deadline, or one per tenant. See vLLM's port for why the
+        # second form is not a convenience: a deadline-ordering policy
+        # sorts by `slo-ms - waiting-ms`, and under a constant `slo-ms`
+        # that expression is strictly decreasing in waiting time, so the
+        # earliest-deadline order *is* the arrival order and EDF is FCFS
+        # with extra arithmetic. Heterogeneous deadlines are what make a
+        # deadline schedulable.
+        #
+        #   SGLANG_PLEX_SLO_MS=30000
+        #   SGLANG_PLEX_SLO_MS=c0=60000,c1=15000,default=30000
+        self._slo_ms = 0
+        self._slo_by_client: dict[str, int] = {}
+        raw = (os.environ.get("SGLANG_PLEX_SLO_MS", "") or "").strip()
+        if "=" in raw:
+            for item in raw.split(","):
+                name, _, value = item.partition("=")
+                try:
+                    number = int(float(value))
+                except ValueError:
+                    continue
+                if name.strip() == "default":
+                    self._slo_ms = number
+                else:
+                    self._slo_by_client[name.strip()] = number
+        elif raw:
+            try:
+                self._slo_ms = int(float(raw))
+            except ValueError:
+                self._slo_ms = 0
+        # The service classes a deployment sells. Neither is derivable:
+        # whether a request may be deferred is a commercial fact about
+        # the tenant, and a per-token latency target is a promise
+        # someone made. The operator states both, exactly as the tenant
+        # label is stated in the request id.
+        self._best_effort = {
+            name.strip()
+            for name in os.environ.get("SGLANG_PLEX_BEST_EFFORT", "").split(",")
+            if name.strip()
+        }
+        self._tpot_ms = int(os.environ.get("SGLANG_PLEX_TPOT_MS", "0") or 0)
         # Stage 3, if a source was named.
         from sglang.srt.managers.plex_verbs import PlexVerbs
 
@@ -222,18 +288,21 @@ class PlexObserver:
             self._finishing.discard(rid)
 
         document_now_ms = int(time.time() * 1000)
+        elapsed_ms = 0
         if self._last_step_ms is not None:
-            self._step_ms_window.append(max(document_now_ms - self._last_step_ms, 0))
+            elapsed_ms = max(document_now_ms - self._last_step_ms, 0)
+            self._step_ms_window.append(elapsed_ms)
             if len(self._step_ms_window) > 32:
                 self._step_ms_window.pop(0)
         self._last_step_ms = document_now_ms
+        self._charge_service(elapsed_ms)
         document = {
             "step": self._step,
             "now-ms": document_now_ms,
             "target": self._target,
             "subjects": self._subjects(tracked),
             "facts": self._facts(tracked, document_now_ms),
-            "events": self._events(departed),
+            "events": self._events(departed, self._progress(tracked)),
         }
         self._admitted.clear()
         return json.dumps(document)
@@ -257,6 +326,78 @@ class PlexObserver:
         scheduler = self._scheduler
         running = list(getattr(scheduler.running_batch, "reqs", []) or [])
         return [*self._held_requests(), *scheduler.waiting_queue, *running]
+
+    def _charge_service(self, elapsed_ms: int) -> None:
+        """Charge the step that just ended to whoever was running in it.
+
+        The interval is measured between step documents, so it is time
+        the engine spent, not time the port spent looking. It is charged
+        to `running_batch.reqs` because that is the set the engine
+        actually computed over.
+
+        Consequence worth stating, and the same one vLLM's port states:
+        the sum over requests exceeds wall clock whenever the batch
+        holds more than one. This is not a partition of engine time and
+        must not be summed to get utilisation.
+        """
+        if elapsed_ms <= 0:
+            return
+        charge = elapsed_ms * 1000
+        live = set()
+        for req in getattr(self._scheduler.running_batch, "reqs", []) or []:
+            rid = getattr(req, "rid", None)
+            if rid is None:
+                continue
+            live.add(rid)
+            self._service_us[rid] = self._service_us.get(rid, 0) + charge
+        # A ledger that outlives its subjects is a leak on a long run,
+        # and the fact is only ever read for a request that is present.
+        if len(self._service_us) > len(live) + 4096:
+            self._service_us = {
+                key: value for key, value in self._service_us.items() if key in live
+            }
+
+    @staticmethod
+    def _tenant_of(rid: str) -> str:
+        """The tenant a request belongs to, from its id.
+
+        SGLang ids arrive with the same generation prefixes vLLM's do,
+        and a lookup that fails to strip them misses every class it was
+        given — silently, because a missing class reads exactly like a
+        deployment that declared none.
+        """
+        name = rid
+        for prefix in ("cmpl-", "chat-"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+        return name.split("-", 1)[0]
+
+    def _slo_of(self, rid: str) -> int:
+        """This request's deadline: its tenant's, or the deployment's."""
+        return self._slo_by_client.get(self._tenant_of(rid), self._slo_ms)
+
+    def _progress(self, tracked: list[Req]) -> list[list[Any]]:
+        """Output growth since last step, per request.
+
+        An edge and not a level. A policy that accumulates work — every
+        one that maintains a virtual clock does — needs to be told what
+        changed, and reconstructing that from a level is exactly the
+        bookkeeping the contract exists to not make policies do.
+        """
+        deltas: list[list[Any]] = []
+        live = set()
+        for req in tracked:
+            rid = req.rid
+            live.add(rid)
+            generated = len(req.output_ids)
+            grew = generated - self._progress_last.get(rid, 0)
+            self._progress_last[rid] = generated
+            if grew > 0:
+                deltas.append([rid, grew])
+        for rid in list(self._progress_last):
+            if rid not in live:
+                del self._progress_last[rid]
+        return deltas
 
     def _facts(self, tracked: list[Req], now_ms: int) -> dict[str, dict[str, Any]]:
         running_ids = {
@@ -339,6 +480,51 @@ class PlexObserver:
                     if running
                     else max(now_ms - self._arrival_ms.get(req.rid, now_ms), 0)
                 },
+                # Engine time received, cumulative. The fact the
+                # fair-share half of the corpus ranks on, and the one
+                # SGLang keeps no counter for; see `_charge_service`.
+                "service_us": {"num": self._service_us.get(req.rid, 0)},
+                # The two costs an eviction policy compares, published
+                # because this engine is the only party that knows
+                # either. Unanswered, `qlm` falls back to comparing two
+                # token counts as if they were durations and returns the
+                # same disposition every time.
+                #
+                # Recompute is the tokens a retraction would discard, at
+                # a stated rate. SGLang's `retract_decode` writes what it
+                # can back into the radix tree, so a restart may recover
+                # part of the prefix and this is an upper bound — which
+                # is the safe direction for a policy deciding whether
+                # preemption is worth it. Swap is the sentinel: not
+                # expensive, unavailable.
+                "recompute_cost_ms": {
+                    "num": int(max(prompt + generated - cached, 0)
+                               * _MS_PER_PREFILL_TOKEN)
+                },
+                "swap_cost_ms": {"num": _NO_SWAP_MS},
+                # Published only when stated. A deadline of zero is not
+                # "no deadline" to a policy that subtracts from it, it
+                # is a deadline already missed, and the two must not
+                # read the same.
+                **(
+                    {"slo_ms": {"num": self._slo_of(req.rid)}}
+                    if self._slo_of(req.rid) > 0
+                    else {}
+                ),
+                # Published unconditionally once any tenant is declared
+                # best-effort, because `false` is then a real answer —
+                # "this request is promised" — and must not read the
+                # same as "nobody said".
+                **(
+                    {
+                        "is_best_effort": {
+                            "flag": self._tenant_of(req.rid) in self._best_effort
+                        }
+                    }
+                    if self._best_effort
+                    else {}
+                ),
+                **({"tpot_ms": {"num": self._tpot_ms}} if self._tpot_ms > 0 else {}),
             }
             # Prefix-cache facts, and only where the engine computed
             # one. vLLM cannot publish these from an observer at all --
@@ -623,7 +809,7 @@ class PlexObserver:
         self._demand_step = self._step
         return demand
 
-    def _events(self, departed: list[str]) -> dict[str, Any]:
+    def _events(self, departed: list[str], progress: list[list[Any]]) -> dict[str, Any]:
         events: dict[str, Any] = {}
         offered = [page_id for page_id, _ in self._offered_pages()]
         # Once per page, not once per step: every accumulator in the
@@ -632,6 +818,8 @@ class PlexObserver:
         if fresh:
             events["offered"] = fresh
         self._offered_last = set(offered)
+        if progress:
+            events["progress"] = progress
         if self._admitted:
             events["admitted"] = list(self._admitted)
         if departed:
