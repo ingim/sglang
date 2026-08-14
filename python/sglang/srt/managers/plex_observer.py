@@ -113,6 +113,41 @@ _MS_PER_PREFILL_TOKEN = 0.05
 _NO_SWAP_MS = 1_000_000_000
 
 
+def _client_of(rid: str) -> str:
+    """The tenant a request belongs to, from the caller's own id."""
+    head, sep, _ = rid.partition("::")
+    return head if sep else rid
+
+
+def _group_of(rid: str) -> str:
+    """The group a request belongs to, from the caller's own id.
+
+    `<client>::<group>::<rest>`. Falls back to the client when there is
+    no second separator, so a workload that names no groups puts each
+    tenant in one group rather than each request in its own — the
+    latter is the degenerate case the group-aware policies are written
+    against.
+    """
+    parts = rid.split("::")
+    if len(parts) >= 3:
+        return f"{parts[0]}::{parts[1]}"
+    return _client_of(rid)
+
+
+def _field_of(rid: str, index: int) -> str:
+    """The nth `::`-separated field of a request id, or the last there is.
+
+    Degrading to a coarser level rather than to nothing matters: a
+    workload that names a user and no application should look like one
+    application per user, not like an absent fact a policy silently
+    defaults.
+    """
+    parts = rid.split("::")
+    if not parts:
+        return rid
+    return parts[min(index, len(parts) - 1)]
+
+
 class PlexObserver:
     """One SGLang scheduler, in the contract's vocabulary. Holds no policy."""
 
@@ -361,16 +396,23 @@ class PlexObserver:
     def _tenant_of(rid: str) -> str:
         """The tenant a request belongs to, from its id.
 
-        SGLang ids arrive with the same generation prefixes vLLM's do,
-        and a lookup that fails to strip them misses every class it was
-        given — silently, because a missing class reads exactly like a
-        deployment that declared none.
+        The same field vLLM's port reads: everything before the first
+        `::` in a `<user>::<app>::<stage>::<unique>` id, with any
+        engine-added generation prefix stripped so an operator
+        declaring a service class writes the tenant they sell to and
+        not an id format.
+
+        This matters more here than on vLLM. SGLang's server invents a
+        uuid unless the client supplies `rid`, so an unlabelled harness
+        gets the default deadline and `is-best-effort: false` for every
+        request — silently, and indistinguishably from a deployment
+        that sells one tier.
         """
-        name = rid
-        for prefix in ("cmpl-", "chat-"):
-            if name.startswith(prefix):
-                name = name[len(prefix) :]
-        return name.split("-", 1)[0]
+        head = rid.split("::", 1)[0]
+        for prefix in ("cmpl-", "chat-", "chatcmpl-", "embd-"):
+            if head.startswith(prefix):
+                return head[len(prefix) :]
+        return head
 
     def _slo_of(self, rid: str) -> int:
         """This request's deadline: its tenant's, or the deployment's."""
@@ -525,6 +567,34 @@ class PlexObserver:
                     else {}
                 ),
                 **({"tpot_ms": {"num": self._tpot_ms}} if self._tpot_ms > 0 else {}),
+                # Who this request belongs to. None of the four is
+                # anything SGLang knows: a tenant is a deployment's
+                # concept, a group is the caller's agent or session, a
+                # user and an application and a stage are the caller's
+                # own structure. All of them arrive in the request id or
+                # not at all — and an engine cannot invent an ownership
+                # it was never told about.
+                #
+                # Absent, every request reports the same tenant and a
+                # fairness policy sees one tenant to be fair between,
+                # which is not a hard case for it, it is no case at all.
+                # Measured on vLLM before the equivalent existed: `vtc`'s
+                # two arms byte-identical at a gap of 7.000.
+                "client_id": {"text": _client_of(req.rid)},
+                "group": {"text": _group_of(req.rid)},
+                # `<user>::<application>::<stage>::<unique>`, each
+                # falling back to what precedes it so a workload that
+                # names fewer levels degrades to coarser accounting
+                # rather than to none.
+                "user_id": {"text": _field_of(req.rid, 0)},
+                "application_id": {"text": _field_of(req.rid, 1)},
+                "stage_id": {"text": _field_of(req.rid, 2)},
+                # Spellings the ports use for quantities already
+                # published above. A port reading `input-tokens` gets
+                # `unknown-key` and takes a default, and the default is
+                # indistinguishable from an answer.
+                "input_tokens": {"num": prompt},
+                "output_tokens": {"num": generated},
             }
             # Prefix-cache facts, and only where the engine computed
             # one. vLLM cannot publish these from an observer at all --
