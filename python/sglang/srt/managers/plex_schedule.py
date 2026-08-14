@@ -56,6 +56,11 @@ class PlexSchedule:
         # document, not a stream of edits, so a partially-applied one is
         # not representable.
         self._rank: dict[str, int] = {}
+        # Reach and effect, mirroring vLLM's `plex_queue`.
+        self.resorts = 0
+        self.ranked = 0
+        self.queued = 0
+        self.moved = 0
         # Where the policy's table arrives from. A path rather than a
         # callback because the policy runs in the PLEX host, not in the
         # engine: the engine must not import a runtime, block on one, or
@@ -251,7 +256,28 @@ class PlexSchedule:
             if req.rid not in self._seen:
                 self._seen.add(req.rid)
                 self._arrivals += 1
+        before = [req.rid for req in waiting_queue]
         waiting_queue.sort(key=lambda req: self._sort_key(req, positions))
+
+        # Did the table actually move anything? vLLM has counted this
+        # since Tier 3; SGLang did not, so every SGLang number in the
+        # record was taken without engine-side evidence that the order
+        # reached the queue. `ranked` is how many queued requests the
+        # policy named -- a policy naming none has decided nothing,
+        # whatever the metric says -- and `moved` is how many changed
+        # position, which is the reordering the engine performed.
+        after = [req.rid for req in waiting_queue]
+        self.resorts += 1
+        self.ranked += sum(1 for rid in before if rid in self._rank)
+        self.queued += len(before)
+        self.moved += sum(1 for a, b in zip(before, after) if a != b)
+        if self.resorts % 50 == 0:
+            print(
+                f"[plex-queue] resorts={self.resorts} queued={self.queued} "
+                f"ranked={self.ranked} moved={self.moved} "
+                f"installs={self._installs} table={len(self._rank)}",
+                flush=True,
+            )
 
     def _sort_key(self, req: Req, positions: dict[str, int]) -> tuple[int, int, int]:
         rank = self._rank.get(req.rid)
