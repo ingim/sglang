@@ -150,6 +150,16 @@ _MS_PER_PREFILL_TOKEN = 0.05
 # time, which a sentinel gives and a large guess does not.
 _NO_SWAP_MS = 1_000_000_000
 
+# Experimental control, off by default. §6.23 concluded that SGLang's
+# failure to publish `predicted_output_tokens` is what made `chameleon`
+# read as a non-reproduction, on the strength of adding the fact and
+# watching the number move. One direction is not a control, so this
+# suppresses exactly that key and nothing else, letting the removal be
+# run under otherwise identical code.
+_SUPPRESS_PREDICTED_OUTPUT = bool(
+    os.environ.get("PLEX_SGLANG_SUPPRESS_PREDICTED_OUTPUT")
+)
+
 
 def _client_of(rid: str) -> str:
     """The tenant a request belongs to, from the caller's own id."""
@@ -434,11 +444,21 @@ class PlexObserver:
     def _tenant_of(rid: str) -> str:
         """The tenant a request belongs to, from its id.
 
-        The same field vLLM's port reads: everything before the first
-        `::` in a `<user>::<app>::<stage>::<unique>` id, with any
-        engine-added generation prefix stripped so an operator
-        declaring a service class writes the tenant they sell to and
-        not an id format.
+        The same field vLLM's port reads, via the same helper: the
+        `<tenant>` of a `[<tenant>@]<program>::<app>::<stage>::<unique>`
+        id, with any engine-added generation prefix stripped so an
+        operator declaring a service class writes the tenant they sell
+        to and not an id format.
+
+        This used to split on `::` alone and stop, which returns
+        `c0@g0` — the tenant *and* the program, welded together. An
+        operator declares `c0`, the lookup key was `c0@g0`, and every
+        membership test and every `_slo_by_client` lookup missed.
+        Measured: 142 of 142 config C requests on the default deadline
+        with `is-best-effort: false`, against vLLM's four classes and
+        110 best-effort requests over the same configuration
+        (§6.24.4/§6.24.5). `_tenant_and_program` was already here and
+        already correct; it simply was not called from this path.
 
         This matters more here than on vLLM. SGLang's server invents a
         uuid unless the client supplies `rid`, so an unlabelled harness
@@ -446,11 +466,7 @@ class PlexObserver:
         request — silently, and indistinguishably from a deployment
         that sells one tier.
         """
-        head = rid.split("::", 1)[0]
-        for prefix in ("cmpl-", "chat-", "chatcmpl-", "embd-"):
-            if head.startswith(prefix):
-                return head[len(prefix) :]
-        return head
+        return _tenant_and_program(rid)[0]
 
     def _slo_of(self, rid: str) -> int:
         """This request's deadline: its tenant's, or the deployment's."""
@@ -641,22 +657,58 @@ class PlexObserver:
                 # which is not a hard case for it, it is no case at all.
                 # Measured on vLLM before the equivalent existed: `vtc`'s
                 # two arms byte-identical at a gap of 7.000.
-                "client_id": {"text": _client_of(req.rid)},
-                "group": {"text": _group_of(req.rid)},
-                # `<user>::<application>::<stage>::<unique>`, each
-                # falling back to what precedes it so a workload that
-                # names fewer levels degrades to coarser accounting
-                # rather than to none.
-                "user_id": {"text": _field_of(req.rid, 0)},
-                "application_id": {"text": _field_of(req.rid, 1)},
-                "stage_id": {"text": _field_of(req.rid, 2)},
+                #
+                # `client_id`, `group`, `user_id`, `application_id` and
+                # `stage_id` were published *twice* in this one dict
+                # literal — once above from `_tenant_and_program`, which
+                # splits the `<tenant>@<program>` head correctly, and
+                # again here from the older `::`-only helpers. Python
+                # keeps the last key, so the older spelling silently won
+                # and every request reported `c0@g0` as its tenant.
+                # Measured: `client_id`, `user_id` and `group` came out
+                # as the identical set partition, 34 blocks where the
+                # workload has 4 tenants, while vLLM published 4/4/8 —
+                # so `--best-effort-clients c0` matched nobody and
+                # `--slo-spread` delivered one class to all 142 requests
+                # (§6.24.4/§6.24.5). The duplicates are removed; the
+                # definitions above stand.
                 # Spellings the ports use for quantities already
                 # published above. A port reading `input-tokens` gets
                 # `unknown-key` and takes a default, and the default is
                 # indistinguishable from an answer.
                 "input_tokens": {"num": prompt},
                 "output_tokens": {"num": generated},
+                # How much output this request asked for.
+                #
+                # vLLM's observer publishes this and SGLang's did not,
+                # and the asymmetry was invisible because a missing fact
+                # reads as a default rather than as an error.
+                # `chameleon` weights request size 0.6 on this number
+                # and 0.4 on input, so with it absent the output term
+                # was zero for every request and the policy ranked on
+                # input alone -- on the exact axis its metric normalizes
+                # away. Measured on the apparatus traces: chameleon's
+                # installed order correlates +0.491 with true output
+                # length on vLLM and -0.067 on SGLang, while correlating
+                # +0.824 with *input* length there. It sorted hard, on
+                # the wrong variable.
+                #
+                # A requested maximum, not a prediction of what will
+                # actually be produced; the ports treat it as the upper
+                # bound it is.
+                "predicted_output_tokens": {
+                    "num": int(getattr(getattr(req, "sampling_params", None),
+                                       "max_new_tokens", 0) or 0)
+                },
             }
+            # Experimental control for §6.23's falsifier. The account
+            # there rests on one manipulation in one direction -- a fact
+            # was added and a number moved -- so removing it again under
+            # otherwise identical code is the test that distinguishes
+            # the fact from everything else that arrived with the edit.
+            # Off unless asked for, and it removes exactly one key.
+            if _SUPPRESS_PREDICTED_OUTPUT:
+                facts[req.rid].pop("predicted_output_tokens", None)
             # Prefix-cache facts, and only where the engine computed
             # one. vLLM cannot publish these from an observer at all --
             # it computes hits inside `schedule()` and never keeps them
